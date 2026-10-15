@@ -33,6 +33,9 @@ type claudeCapabilities struct {
 	supportsXHigh         bool
 	supportsMax           bool
 	strictSampling        bool
+	// effortOnly selects compatible models that expose named effort levels
+	// without Anthropic's manual token budget control.
+	effortOnly bool
 	// offEffortAtMostHigh marks models that accept effort high or below only
 	// while thinking is off (disabled or between_tools).
 	offEffortAtMostHigh bool
@@ -47,6 +50,14 @@ func claudeCapabilitiesFor(model string) claudeCapabilities {
 	capabilities := claudeCapabilities{supportsManual: true, supportsDisable: true, defaultEffort: EffortHigh}
 
 	switch {
+	case model == "k3", model == "k3-256k":
+		// Kimi Code's Anthropic surface accepts low/high/max. It maps
+		// medium to high and xhigh to max; token budgets do not set effort.
+		// https://www.kimi.com/code/docs/en/kimi-code/models
+		capabilities.supportsManual = false
+		capabilities.supportsEffort = true
+		capabilities.supportsMax = true
+		capabilities.effortOnly = true
 	case strings.HasPrefix(model, "claude-fable-5"),
 		strings.HasPrefix(model, "claude-mythos-5"):
 		capabilities.adaptive = true
@@ -132,6 +143,25 @@ func RenderClaude(model string, intent Intent, maxTokens *uint, adapterBudgetPer
 		diagnostics = append(diagnostics, normalizeDiagnostics...)
 	}
 	capabilities := claudeCapabilitiesFor(model)
+	if capabilities.effortOnly {
+		if !intent.HasStrength() {
+			return ClaudeRender{}, nil
+		}
+		if intent.Mode == ModeDisabled || intent.Effort == EffortNone {
+			return ClaudeRender{Thinking: &dto.Thinking{Type: "disabled"}, EffectiveEffort: EffortNone, Diagnostics: diagnostics}, nil
+		}
+		effort := intent.Effort
+		if effort == "" && intent.BudgetTokens != nil {
+			effort = EffortFromBudget(*intent.BudgetTokens)
+			diagnostics = append(diagnostics, claudeReasoningDiagnostic("claude_budget_to_effort", fmt.Sprintf("model %q uses named effort; budget_tokens was converted to an effort level", model)))
+		}
+		if effort == "" {
+			effort = capabilities.defaultEffort
+		}
+		normalized := normalizeClaudeEffort(effort, capabilities)
+		diagnostics = append(diagnostics, claudeEffortDiagnostics(model, effort, normalized)...)
+		return ClaudeRender{Thinking: &dto.Thinking{Type: "enabled"}, OutputEffort: normalized, EffectiveEffort: normalized, Diagnostics: diagnostics}, nil
+	}
 	if !intent.HasStrength() {
 		if intent.IncludeThoughts != nil && capabilities.adaptive && capabilities.defaultThinking {
 			thinking := &dto.Thinking{Type: "adaptive"}
@@ -417,6 +447,12 @@ func IsKnownClaudeModel(model string) bool {
 	return isKnownClaudeModel(model)
 }
 
+// HasClaudeReasoningProfile reports whether the Claude wire target has known
+// reasoning controls, including supported third-party Anthropic dialects.
+func HasClaudeReasoningProfile(model string) bool {
+	return isKnownClaudeModel(model) || claudeCapabilitiesFor(model).effortOnly
+}
+
 // ClaudeDefaultEffort is the effort the model runs at when a request sets
 // none.
 func ClaudeDefaultEffort(model string) Effort {
@@ -455,6 +491,10 @@ func ResolveClaudeDefault(model string, intent Intent) Intent {
 
 func normalizeClaudeEffort(effort Effort, capabilities claudeCapabilities) Effort {
 	switch effort {
+	case EffortMedium:
+		if capabilities.effortOnly {
+			return EffortHigh
+		}
 	case EffortMinimal:
 		return EffortLow
 	case EffortXHigh:

@@ -149,3 +149,30 @@ func TestStrictUsageOnlyChunkDoesNotCompleteClaudeStream(t *testing.T) {
 		require.Equal(t, 1, state.Usage().CompletionTokens)
 	}
 }
+
+func TestLateUsageOptInPreservesCacheCreationAndEmitsOnce(t *testing.T) {
+	state, err := NewResponseStreamState(types.RelayFormatOpenAIResponses, types.RelayFormatOpenAI, ResponseStreamOptions{RequireTerminalEvent: true})
+	require.NoError(t, err)
+	_, err = ConvertStreamResponseChunk(context.Background(), nil, state, compatDecode[dto.ResponsesStreamResponse](t, `{"type":"response.created","response":{"id":"r"}}`))
+	require.NoError(t, err)
+	state.SetIncludeUsage(true)
+	results, err := ConvertStreamResponseChunk(context.Background(), nil, state, compatDecode[dto.ResponsesStreamResponse](t, `{"type":"response.completed","response":{"id":"r","status":"completed","usage":{"input_tokens":566,"output_tokens":49,"total_tokens":615,"input_tokens_details":{"cached_tokens":241,"cached_creation_tokens":17}}}}`))
+	require.NoError(t, err)
+	final, err := FinalizeStreamResponse(context.Background(), nil, state)
+	require.NoError(t, err)
+	count := 0
+	for _, result := range append(results, final...) {
+		chunk := result.Value.(dto.ChatCompletionsStreamResponse)
+		if chunk.Usage == nil {
+			continue
+		}
+		count++
+		require.Empty(t, chunk.Choices)
+		require.Equal(t, 566, chunk.Usage.PromptTokens)
+		require.Equal(t, 49, chunk.Usage.CompletionTokens)
+		require.Equal(t, 615, chunk.Usage.TotalTokens)
+		require.Equal(t, 241, chunk.Usage.PromptTokensDetails.CachedTokens)
+		require.Equal(t, 17, chunk.Usage.PromptTokensDetails.CachedCreationTokens)
+	}
+	require.Equal(t, 1, count)
+}

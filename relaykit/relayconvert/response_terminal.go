@@ -55,3 +55,16 @@ func sourceStreamHasTerminal(response any) bool {
 	}
 	return false
 }
+
+// SetIncludeUsage updates whether a Chat target emits its final usage chunk.
+// It can be enabled after the source first reports authoritative usage.
+func (s *ResponseStreamState) SetIncludeUsage(include bool) {
+	if s == nil {
+		return
+	}
+	for _, state := range s.stepStates {
+		if setter, ok := state.(interface{ SetIncludeUsage(bool) }); ok {
+			setter.SetIncludeUsage(include)
+		}
+	}
+}

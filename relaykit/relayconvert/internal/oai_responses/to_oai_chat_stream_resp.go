@@ -1090,3 +1090,10 @@ func (a *ResponsesBufferedAccumulator) findToolIndex(event *dto.ResponsesStreamR
 	}
 	return 0, false
 }
+
+// SetIncludeUsage allows a host to opt into usage once an upstream reports it.
+func (s *ResponsesToChatStreamState) SetIncludeUsage(include bool) {
+	if s != nil {
+		s.IncludeUsage = include
+	}
+}

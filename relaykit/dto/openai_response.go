@@ -666,16 +666,9 @@ func GetOpenAIError(errorField any) *types.OpenAIError {
 // library's canonical spelling on output.
 func (d *InputTokenDetails) UnmarshalJSON(data []byte) error {
 	type plain InputTokenDetails
-	var value struct {
-		plain
-		CacheCreationTokens *int `json:"cache_creation_tokens"`
-	}
-	if err := kitutil.Unmarshal(data, &value); err != nil {
+	normalized, err := NormalizeInputTokenDetailsJSON(data)
+	if err != nil {
 		return err
 	}
-	*d = InputTokenDetails(value.plain)
-	if d.CachedCreationTokens == 0 && value.CacheCreationTokens != nil {
-		d.CachedCreationTokens = *value.CacheCreationTokens
-	}
-	return nil
+	return kitutil.Unmarshal(normalized, (*plain)(d))
 }

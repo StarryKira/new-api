@@ -62,7 +62,7 @@ func ApplyReasoning(ctx context.Context, req *dto.ClaudeRequest, info convmeta.M
 		return err
 	}
 	convdiag.Add(ctx, diagnostics...)
-	if info != nil && !reasoning.IsKnownClaudeModel(capabilityModel) && reasoning.IsKnownClaudeModel(info.GetOriginModelName()) {
+	if info != nil && !reasoning.HasClaudeReasoningProfile(capabilityModel) && reasoning.IsKnownClaudeModel(info.GetOriginModelName()) {
 		capabilityModel = info.GetOriginModelName()
 	}
 	intent, diagnostics, err := reasoning.MergeExplicitAndSuffix(explicit, suffix, req.Model)
@@ -70,8 +70,8 @@ func ApplyReasoning(ctx context.Context, req *dto.ClaudeRequest, info convmeta.M
 		return err
 	}
 	convdiag.Add(ctx, diagnostics...)
-	knownClaudeModel := reasoning.IsKnownClaudeModel(capabilityModel)
-	if !knownClaudeModel && intent.Mode == reasoning.ModeAdaptive {
+	knownReasoningProfile := reasoning.HasClaudeReasoningProfile(capabilityModel)
+	if !knownReasoningProfile && intent.Mode == reasoning.ModeAdaptive {
 		// Cross-protocol pivots cannot safely assume that an unknown
 		// Claude-compatible model implements Anthropic's adaptive mode. Render
 		// the broadly supported manual form while retaining the requested
@@ -85,7 +85,7 @@ func ApplyReasoning(ctx context.Context, req *dto.ClaudeRequest, info convmeta.M
 	if err != nil {
 		return err
 	}
-	if knownClaudeModel && intent.Mode == reasoning.ModeDisabled && (intent.Effort == "" || intent.Effort == reasoning.EffortNone) &&
+	if knownReasoningProfile && intent.Mode == reasoning.ModeDisabled && (intent.Effort == "" || intent.Effort == reasoning.EffortNone) &&
 		requestEffort != "" && requestEffort != reasoning.EffortNone {
 		// Effort works without thinking, so the request's own effort is
 		// rendered for the thinking-off state rather than left unchecked.
@@ -130,7 +130,7 @@ func ApplyReasoning(ctx context.Context, req *dto.ClaudeRequest, info convmeta.M
 	outputEffort := rendered.OutputEffort
 	// An effort the request still carries reaches a known model only at a
 	// level it accepts, and is removed where the model takes none.
-	rewriteRequestEffort := outputEffort == "" && knownClaudeModel && requestEffort != ""
+	rewriteRequestEffort := outputEffort == "" && knownReasoningProfile && requestEffort != ""
 	if rewriteRequestEffort {
 		outputEffort = reasoning.ClaudeEffort(capabilityModel, requestEffort)
 	}

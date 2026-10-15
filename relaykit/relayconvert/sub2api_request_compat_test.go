@@ -3,6 +3,7 @@ package relayconvert
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
@@ -11,6 +12,46 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/stretchr/testify/require"
 )
+
+// sub2api e47255715: accounting must use the effort rendered for the target.
+// Kimi Code accepts named effort on its Anthropic surface, not a manual budget.
+func TestKimiCodeAnthropicReasoningUsesNamedEffort(t *testing.T) {
+	for _, model := range []string{"k3", "k3-256k"} {
+		for _, test := range []struct {
+			effort string
+			want   string
+		}{
+			{"", ""}, {"none", ""}, {"minimal", "low"}, {"low", "low"},
+			{"medium", "high"}, {"high", "high"}, {"xhigh", "max"}, {"max", "max"},
+		} {
+			t.Run(model+"/"+test.effort, func(t *testing.T) {
+				var req dto.OpenAIResponsesRequest
+				require.NoError(t, kitutil.Unmarshal([]byte(fmt.Sprintf(`{"model":%q,"input":"hello","reasoning":{"effort":%q}}`, model, test.effort)), &req))
+				meta := &convmeta.Values{OriginModelName: "claude-fable-5-1", UpstreamModelName: model, Options: &convmeta.Options{Claude: convmeta.ClaudeOptions{DefaultMaxTokens: func(string) int { return 8192 }}}}
+				result, err := ConvertRequest(context.Background(), meta, types.RelayFormatClaude, &req)
+				require.NoError(t, err)
+				out := result.Value.(*dto.ClaudeRequest)
+				require.Equal(t, test.want, out.GetEfforts())
+				wantRecord := test.want
+				if test.effort == "none" {
+					wantRecord = "none"
+				}
+				require.Equal(t, wantRecord, meta.GetReasoningEffort())
+				if test.effort == "" {
+					require.Nil(t, out.Thinking)
+				} else {
+					require.NotNil(t, out.Thinking)
+					require.Nil(t, out.Thinking.BudgetTokens)
+					if test.effort == "none" {
+						require.Equal(t, "disabled", out.Thinking.Type)
+					} else {
+						require.Equal(t, "enabled", out.Thinking.Type)
+					}
+				}
+			})
+		}
+	}
+}
 
 // sub2api 9a8ab4f88 / 7a767d5ce: developer priority and legacy history must
 // survive conversion; legacy call IDs are deterministic and cannot collide.

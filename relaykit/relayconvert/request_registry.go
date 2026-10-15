@@ -243,6 +243,9 @@ func executeRequestSpec(c context.Context, info convmeta.Meta, from types.RelayF
 
 func executeRequestSteps(c context.Context, info convmeta.Meta, from types.RelayFormat, target types.RelayFormat, request any, converter string, quality RequestConverterQuality, specs []RequestConverterSpec) (*RequestResult, error) {
 	c, diagnosticCollector := convdiag.WithCollector(c)
+	if from == types.RelayFormatOpenAI {
+		request = normalizeChatInstructions(request)
+	}
 	current, tools, err := toolconv.ExtractRequest(from, request)
 	if err != nil {
 		return nil, err
