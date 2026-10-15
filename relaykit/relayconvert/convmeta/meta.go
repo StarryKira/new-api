@@ -67,11 +67,15 @@ type Meta interface {
 // ClaudeConvertInfo carries mutable state for OpenAI chat → Claude Messages
 // stream conversion. Moved here from relay/common (which keeps an alias).
 type ClaudeConvertInfo struct {
-	LastMessagesType string
-	Index            int
-	Usage            *dto.Usage
-	FinishReason     string
-	Done             bool
+	ReasoningText        strings.Builder
+	RequireTerminalEvent bool
+	SawText              bool
+	SawToolCall          bool
+	LastMessagesType     string
+	Index                int
+	Usage                *dto.Usage
+	FinishReason         string
+	Done                 bool
 
 	ToolCallBaseIndex      int
 	ToolCallMaxIndexOffset int
@@ -89,15 +93,20 @@ type ClaudeStreamToolCall struct {
 	Name             string
 	PendingArguments string
 	Started          bool
+	HasArguments     bool
 }
 
 // ResponsesToolState records how Responses-only tool definitions were encoded
 // for the upstream protocol, so the matching response can be restored.
 type ResponsesToolState struct {
+	// ToolSearch records the client tool_search lowered to a function.
+	ToolSearch bool
+
 	// CustomToolNames lists Responses custom (freeform) tools that were sent
 	// upstream as function tools taking one string "input" argument. Function
 	// calls with these names are custom tool calls.
-	CustomToolNames map[string]struct{}
+	CustomToolNames   map[string]struct{}
+	FunctionToolNames map[string]struct{}
 	// Namespaces maps an upstream function name to the Responses tool
 	// namespace it was flattened from; see NamespacedToolName.
 	Namespaces map[string]string
@@ -106,6 +115,8 @@ type ResponsesToolState struct {
 // CustomToolInputArgument is the single function argument that carries a
 // Responses custom tool input through an upstream function call.
 const CustomToolInputArgument = "input"
+
+const ToolSearchFunctionName = "tool_search"
 
 // DefaultResponsesToolNamespace is the namespace Codex declares its ordinary
 // tools in. OpenAI returns calls to its tools by bare name without a
@@ -123,12 +134,29 @@ func NamespacedToolName(namespace string, name string) string {
 }
 
 // IsCustomTool reports whether name was encoded from a Responses custom tool.
-func (s *ResponsesToolState) IsCustomTool(name string) bool {
+func (s *ResponsesToolState) IsCustomTool(name string) bool { return s.CustomToolName(name) != "" }
+
+// CustomToolName recognizes provider-qualified aliases without stealing a
+// separately declared function tool with the same qualified name.
+func (s *ResponsesToolState) CustomToolName(name string) string {
 	if s == nil {
-		return false
+		return ""
 	}
-	_, ok := s.CustomToolNames[name]
-	return ok
+	if _, exact := s.FunctionToolNames[name]; exact {
+		return ""
+	}
+	if _, ok := s.CustomToolNames[name]; ok {
+		return name
+	}
+	for _, prefix := range []string{"functions__", "functions."} {
+		if strings.HasPrefix(name, prefix) {
+			bare := strings.TrimPrefix(name, prefix)
+			if _, ok := s.CustomToolNames[bare]; ok {
+				return bare
+			}
+		}
+	}
+	return ""
 }
 
 // ResponsesToolName restores the Responses namespace and tool name of an
@@ -137,6 +165,9 @@ func (s *ResponsesToolState) IsCustomTool(name string) bool {
 func (s *ResponsesToolState) ResponsesToolName(upstreamName string) (string, string) {
 	if s == nil {
 		return "", upstreamName
+	}
+	if name := s.CustomToolName(upstreamName); name != "" {
+		return "", name
 	}
 	namespace, ok := s.Namespaces[upstreamName]
 	if !ok {

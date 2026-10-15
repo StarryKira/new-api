@@ -1,12 +1,11 @@
 package oaichat
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
 	"strings"
-
-	"context"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
@@ -25,6 +24,9 @@ func OpenAIChatRequestToGeminiGenerateContent(c context.Context, textRequest dto
 		},
 	}
 
+	if textRequest.TopK != nil {
+		geminiRequest.GenerationConfig.TopK = kitutil.GetPointer(float64(*textRequest.TopK))
+	}
 	if textRequest.TopP != nil {
 		geminiRequest.GenerationConfig.TopP = kitutil.GetPointer(*textRequest.TopP)
 	}
@@ -166,7 +168,7 @@ func OpenAIChatRequestToGeminiGenerateContent(c context.Context, textRequest dto
 					}
 				}
 			}
-			tool.Function.Parameters = sharedgemini.CleanFunctionParameters(tool.Function.Parameters)
+			tool.Function.Parameters = sharedgemini.CleanFunctionParameters(tool.Function.Parameters, opts.Gemini.StringifyScalarEnums)
 			functions = append(functions, tool.Function)
 		}
 		geminiTools := geminiRequest.GetTools()
@@ -213,6 +215,27 @@ func OpenAIChatRequestToGeminiGenerateContent(c context.Context, textRequest dto
 			}
 			var contentMap map[string]any
 			contentStr := message.StringContent()
+			var toolMedia []dto.GeminiPart
+			var toolText strings.Builder
+			for _, part := range message.ParseContent() {
+				if part.Type == dto.ContentTypeText {
+					toolText.WriteString(part.Text)
+					continue
+				}
+				mediaPart, err := openAIContentToGeminiMedia(c, part)
+				if err != nil {
+					return nil, err
+				}
+				if mediaPart != nil {
+					toolMedia = append(toolMedia, *mediaPart)
+				}
+			}
+			if !message.IsStringContent() {
+				contentStr = toolText.String()
+			}
+			if contentStr == "" && len(toolMedia) > 0 {
+				contentStr = "[media attached]"
+			}
 
 			if err := kitutil.Unmarshal([]byte(contentStr), &contentMap); err != nil {
 				var contentSlice []any
@@ -238,10 +261,21 @@ func OpenAIChatRequestToGeminiGenerateContent(c context.Context, textRequest dto
 			*parts = append(*parts, dto.GeminiPart{
 				FunctionResponse: functionResp,
 			})
+			*parts = append(*parts, toolMedia...)
 			continue
 		}
 
 		var parts []dto.GeminiPart
+		if message.ReasoningContent != nil || message.ReasoningSignature != "" {
+			part := dto.GeminiPart{Thought: true}
+			if message.ReasoningContent != nil {
+				part.Text = *message.ReasoningContent
+			}
+			if message.ReasoningSignature != "" {
+				part.ThoughtSignature, _ = kitutil.Marshal(message.ReasoningSignature)
+			}
+			parts = append(parts, part)
+		}
 		content := dto.GeminiChatContent{
 			Role: message.Role,
 		}
@@ -256,13 +290,16 @@ func OpenAIChatRequestToGeminiGenerateContent(c context.Context, textRequest dto
 					}
 				}
 				toolCall := dto.GeminiPart{
+					ThoughtSignature: call.ExtraContent.ThoughtSignature(),
 					FunctionCall: &dto.FunctionCall{
 						ID:           call.ID,
 						FunctionName: call.Function.Name,
 						Arguments:    args,
 					},
 				}
-				if shouldAttachThoughtSignature && !signatureAttached && sharedgemini.AttachFunctionCallThoughtSignature(opts, &toolCall) {
+				if len(toolCall.ThoughtSignature) > 0 {
+					signatureAttached = true
+				} else if shouldAttachThoughtSignature && !signatureAttached && sharedgemini.AttachFunctionCallThoughtSignature(opts, &toolCall) {
 					signatureAttached = true
 				}
 				parts = append(parts, toolCall)
@@ -321,31 +358,22 @@ func OpenAIChatRequestToGeminiGenerateContent(c context.Context, textRequest dto
 					parts = append(parts, imgPart)
 					text = text[closeIdx+1:]
 				}
+				if hasMarkdownImage && text != "" {
+					parts = append(parts, dto.GeminiPart{Text: text})
+				}
 				if !hasMarkdownImage {
 					parts = append(parts, dto.GeminiPart{
 						Text: part.Text,
 					})
 				}
 			} else {
-				source := part.ToFileSource()
-				if source == nil {
-					continue
-				}
-				base64Data, mimeType, err := relaymedia.ResolveBase64Data(c, source, "formatting image for Gemini")
+				mediaPart, err := openAIContentToGeminiMedia(c, part)
 				if err != nil {
-					return nil, fmt.Errorf("get file data from '%s' failed: %w", source.GetIdentifier(), err)
+					return nil, err
 				}
-
-				if !sharedgemini.IsSupportedMimeType(mimeType) {
-					return nil, fmt.Errorf("mime type is not supported by Gemini: '%s', url: '%s', supported types are: %v", mimeType, source.GetIdentifier(), sharedgemini.SupportedMimeTypesList())
+				if mediaPart != nil {
+					parts = append(parts, *mediaPart)
 				}
-
-				parts = append(parts, dto.GeminiPart{
-					InlineData: &dto.GeminiInlineData{
-						MimeType: mimeType,
-						Data:     base64Data,
-					},
-				})
 			}
 		}
 
@@ -358,7 +386,12 @@ func OpenAIChatRequestToGeminiGenerateContent(c context.Context, textRequest dto
 			content.Role = "model"
 		}
 		if len(content.Parts) > 0 {
-			geminiRequest.Contents = append(geminiRequest.Contents, content)
+			if content.Role == "user" && len(geminiRequest.Contents) > 0 && geminiRequest.Contents[len(geminiRequest.Contents)-1].Role == "user" {
+				previous := &geminiRequest.Contents[len(geminiRequest.Contents)-1]
+				previous.Parts = append(previous.Parts, content.Parts...)
+			} else {
+				geminiRequest.Contents = append(geminiRequest.Contents, content)
+			}
 		}
 	}
 
@@ -373,4 +406,21 @@ func OpenAIChatRequestToGeminiGenerateContent(c context.Context, textRequest dto
 	}
 
 	return &geminiRequest, nil
+}
+
+// openAIContentToGeminiMedia handles both user content and media attached to
+// function results so the latter cannot be stringified or silently discarded.
+func openAIContentToGeminiMedia(ctx context.Context, part dto.MediaContent) (*dto.GeminiPart, error) {
+	source := part.ToFileSource()
+	if source == nil {
+		return nil, nil
+	}
+	data, mimeType, err := relaymedia.ResolveBase64Data(ctx, source, "formatting media for Gemini")
+	if err != nil {
+		return nil, fmt.Errorf("get file data from '%s' failed: %w", source.GetIdentifier(), err)
+	}
+	if !sharedgemini.IsSupportedMimeType(mimeType) {
+		return nil, fmt.Errorf("mime type is not supported by Gemini: '%s', url: '%s', supported types are: %v", mimeType, source.GetIdentifier(), sharedgemini.SupportedMimeTypesList())
+	}
+	return &dto.GeminiPart{InlineData: &dto.GeminiInlineData{MimeType: mimeType, Data: data}}, nil
 }

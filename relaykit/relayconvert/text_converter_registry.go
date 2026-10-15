@@ -150,10 +150,7 @@ var builtinTextConverters = []TextConverterSpec{
 		To:      types.RelayFormatGemini,
 		Quality: TextConverterQualityDiscouraged,
 		Req: TextRequestSide{
-			StepConverters: []string{
-				ConverterClaudeMessagesToOpenAIChat,
-				ConverterOpenAIChatToGeminiContent,
-			},
+			Convert: convertClaudeRequestToGemini,
 		},
 		Resp: TextResponseSide{
 			StepConverters: []string{
@@ -172,11 +169,11 @@ var builtinTextConverters = []TextConverterSpec{
 			Convert: convertClaudeRequestToOpenAIResponses,
 		},
 		Resp: TextResponseSide{
-			StepConverters: []string{
-				ConverterClaudeMessagesToOpenAIChat,
-				ConverterOpenAIChatToOpenAIResponses,
-			},
-			Aliases: []string{responseConverterClaudeToResponses},
+			Convert:            convertClaudeResponseToOAIResponses,
+			NewStreamState:     newClaudeToOAIResponsesStreamState,
+			ConvertStreamChunk: convertClaudeStreamToOAIResponses,
+			FinalizeStream:     finalizeClaudeToOAIResponsesStream,
+			Aliases:            []string{responseConverterClaudeToResponses},
 		},
 	},
 	{
@@ -191,11 +188,12 @@ var builtinTextConverters = []TextConverterSpec{
 			},
 		},
 		Resp: TextResponseSide{
-			StepConverters: []string{
-				ConverterGeminiContentToOpenAIChat,
-				ConverterOpenAIChatToClaudeMessages,
-			},
-			Aliases: []string{responseConverterGeminiToClaude},
+			Convert:            convertGeminiChatResponseToClaudeMessages,
+			ConvertStream:      convertGeminiChatStreamResponseToClaudeMessages,
+			NewStreamState:     newGeminiChatToOAIChatStreamState,
+			ConvertStreamChunk: convertGeminiChatStreamResponseChunkToClaudeMessages,
+			FinalizeStream:     finalizeGeminiChatStreamResponseToClaudeMessages,
+			Aliases:            []string{responseConverterGeminiToClaude},
 		},
 	},
 	{

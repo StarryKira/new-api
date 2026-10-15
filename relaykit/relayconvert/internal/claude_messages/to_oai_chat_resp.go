@@ -60,11 +60,17 @@ func StreamResponseClaude2OpenAI(claudeResponse *dto.ClaudeResponse) *dto.ChatCo
 					choice.Delta.Annotations, _ = marshalChatAnnotations(annotations)
 				}
 			}
+			if claudeResponse.ContentBlock.Type == "thinking" {
+				choice.Delta.ReasoningContent = claudeResponse.ContentBlock.Thinking
+				choice.Delta.ReasoningSignature = claudeResponse.ContentBlock.Signature
+			}
 			if claudeResponse.ContentBlock.Type == "tool_use" {
+				signature, _ := kitutil.Marshal(claudeResponse.ContentBlock.Signature)
 				tools = append(tools, dto.ToolCallResponse{
-					Index: kitutil.GetPointer(fcIdx),
-					ID:    claudeResponse.ContentBlock.Id,
-					Type:  "function",
+					ExtraContent: dto.GoogleThoughtSignature(signature),
+					Index:        kitutil.GetPointer(fcIdx),
+					ID:           claudeResponse.ContentBlock.Id,
+					Type:         "function",
 					Function: dto.FunctionResponse{
 						Name:      claudeResponse.ContentBlock.Name,
 						Arguments: "",
@@ -87,8 +93,7 @@ func StreamResponseClaude2OpenAI(claudeResponse *dto.ClaudeResponse) *dto.ChatCo
 					},
 				})
 			case "signature_delta":
-				signatureContent := "\n"
-				choice.Delta.ReasoningContent = &signatureContent
+				choice.Delta.ReasoningSignature = claudeResponse.Delta.Signature
 			case "thinking_delta":
 				choice.Delta.ReasoningContent = claudeResponse.Delta.Thinking
 			case "citations_delta":
@@ -129,6 +134,8 @@ type ClaudeToChatStreamState struct {
 	toolIndexByContentBlock map[int]int
 	blockTypeByContentBlock map[int]string
 	nextToolIndex           int
+	inlineInput             map[int]string
+	seenInputDelta          map[int]bool
 }
 
 func NewClaudeToChatStreamState() *ClaudeToChatStreamState {
@@ -152,6 +159,10 @@ func (s *ClaudeToChatStreamState) ConvertChunk(claudeResponse *dto.ClaudeRespons
 		s.blockTypeByContentBlock = make(map[int]string)
 	}
 
+	if s.inlineInput == nil {
+		s.inlineInput = make(map[int]string)
+		s.seenInputDelta = make(map[int]bool)
+	}
 	converted := *claudeResponse
 	switch claudeResponse.Type {
 	case "content_block_start":
@@ -179,6 +190,16 @@ func (s *ClaudeToChatStreamState) ConvertChunk(claudeResponse *dto.ClaudeRespons
 			s.nextToolIndex++
 			s.toolIndexByContentBlock[contentBlockIndex] = toolIndex
 		}
+		s.inlineInput[contentBlockIndex] = "{}"
+		if claudeResponse.ContentBlock.Input != nil {
+			raw, err := kitutil.Marshal(claudeResponse.ContentBlock.Input)
+			if err != nil {
+				return nil, fmt.Errorf("marshal Claude tool input: %w", err)
+			}
+			if string(raw) != "{}" && string(raw) != "null" {
+				s.inlineInput[contentBlockIndex] = string(raw)
+			}
+		}
 		converted.Index = kitutil.GetPointer(toolIndex)
 	case "content_block_delta":
 		if claudeResponse.Delta == nil || claudeResponse.Delta.Type != "input_json_delta" {
@@ -198,10 +219,20 @@ func (s *ClaudeToChatStreamState) ConvertChunk(claudeResponse *dto.ClaudeRespons
 			}
 			return nil, fmt.Errorf("Claude tool-use stream delta references unknown content block index %d", contentBlockIndex)
 		}
+		s.seenInputDelta[contentBlockIndex] = true
 		converted.Index = kitutil.GetPointer(toolIndex)
 	case "content_block_stop":
 		if claudeResponse.Index != nil {
-			delete(s.blockTypeByContentBlock, *claudeResponse.Index)
+			index := *claudeResponse.Index
+			delete(s.blockTypeByContentBlock, index)
+			seed, seen := s.inlineInput[index], s.seenInputDelta[index]
+			delete(s.inlineInput, index)
+			delete(s.seenInputDelta, index)
+			if seed != "" && !seen {
+				converted.Type = "content_block_delta"
+				converted.Index = kitutil.GetPointer(s.toolIndexByContentBlock[index])
+				converted.Delta = &dto.ClaudeMediaMessage{Type: "input_json_delta", PartialJson: &seed}
+			}
 		}
 	}
 
@@ -234,6 +265,7 @@ func ResponseClaude2OpenAI(claudeResponse *dto.ClaudeResponse) *dto.OpenAITextRe
 	}
 	tools := make([]dto.ToolCallResponse, 0)
 	thinkingContent := ""
+	thinkingSignature := ""
 	annotations := make([]any, 0)
 
 	fullTextResponse.Id = claudeResponse.Id
@@ -241,15 +273,18 @@ func ResponseClaude2OpenAI(claudeResponse *dto.ClaudeResponse) *dto.OpenAITextRe
 		switch message.Type {
 		case "tool_use":
 			args, _ := kitutil.Marshal(message.Input)
+			signature, _ := kitutil.Marshal(message.Signature)
 			tools = append(tools, dto.ToolCallResponse{
-				ID:   message.Id,
-				Type: "function",
+				ExtraContent: dto.GoogleThoughtSignature(signature),
+				ID:           message.Id,
+				Type:         "function",
 				Function: dto.FunctionResponse{
 					Name:      message.Name,
 					Arguments: string(args),
 				},
 			})
 		case "thinking":
+			thinkingSignature = message.Signature
 			if message.Thinking != nil {
 				thinkingContent = *message.Thinking
 			}
@@ -271,6 +306,7 @@ func ResponseClaude2OpenAI(claudeResponse *dto.ClaudeResponse) *dto.OpenAITextRe
 		},
 		FinishReason: StopReasonClaudeToOpenAI(claudeResponse.StopReason),
 	}
+	choice.Message.ReasoningSignature = thinkingSignature
 	choice.SetStringContent(responseText.String())
 	if encodedAnnotations, err := marshalChatAnnotations(annotations); err == nil && len(encodedAnnotations) > 0 {
 		choice.Message.Annotations = encodedAnnotations

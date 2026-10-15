@@ -12,6 +12,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/internal/convdiag"
 	relaymedia "github.com/QuantumNous/new-api/relaykit/relayconvert/internal/media"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert/internal/shared/tooloutput"
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/reasoning"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -32,6 +33,10 @@ const (
 )
 
 func ResponsesRequestToChatCompletionsRequest(ctx context.Context, req *dto.OpenAIResponsesRequest) (*dto.GeneralOpenAIRequest, error) {
+	return ResponsesRequestToChatCompletionsRequestWithOptions(ctx, req, nil)
+}
+
+func ResponsesRequestToChatCompletionsRequestWithOptions(ctx context.Context, req *dto.OpenAIResponsesRequest, options *convmeta.Options) (*dto.GeneralOpenAIRequest, error) {
 	if req == nil {
 		return nil, errors.New("request is nil")
 	}
@@ -42,7 +47,7 @@ func ResponsesRequestToChatCompletionsRequest(ctx context.Context, req *dto.Open
 		return nil, err
 	}
 
-	messages, err := responsesRequestMessagesToChat(ctx, req)
+	messages, err := responsesRequestMessagesToChatWithOptions(ctx, req, options)
 	if err != nil {
 		return nil, err
 	}
@@ -144,6 +149,10 @@ func ValidateRequestChatUnsupportedFields(req *dto.OpenAIResponsesRequest) error
 }
 
 func responsesRequestMessagesToChat(ctx context.Context, req *dto.OpenAIResponsesRequest) ([]dto.Message, error) {
+	return responsesRequestMessagesToChatWithOptions(ctx, req, nil)
+}
+
+func responsesRequestMessagesToChatWithOptions(ctx context.Context, req *dto.OpenAIResponsesRequest, options *convmeta.Options) ([]dto.Message, error) {
 	messages := make([]dto.Message, 0)
 	if rawJSONPresent(req.Instructions) {
 		instructions, err := responsesJSONString(req.Instructions)
@@ -169,15 +178,29 @@ func responsesRequestMessagesToChat(ctx context.Context, req *dto.OpenAIResponse
 		return messages, nil
 	case "array":
 		var items []map[string]any
-		if err := kitutil.Unmarshal(req.Input, &items); err != nil {
+		if err := kitutil.UnmarshalUseNumber(req.Input, &items); err != nil {
 			return nil, fmt.Errorf("invalid input array: %w", err)
+		}
+		if options != nil && options.RepairToolHistory {
+			items = repairResponsesToolItems(items)
 		}
 		// Chat Completions requires the tool messages answering one assistant tool_calls
 		// batch to stay contiguous, so media hoisted out of tool output items is
 		// held back and emitted as a single user message once the batch ends.
 		var pendingMedia []any
+		var turnReasoning string
 		for _, item := range items {
 			itemType := strings.TrimSpace(kitutil.Interface2String(item["type"]))
+			if itemType == "reasoning" {
+				text := responsesReasoningText(item)
+				if text == "" && options != nil && options.ReasoningContentByID != nil {
+					text = options.ReasoningContentByID(kitutil.Interface2String(item["id"]))
+				}
+				if text != "" {
+					turnReasoning = text
+				}
+				continue
+			}
 			if len(pendingMedia) > 0 && itemType != responsesInputTypeFunctionCallOutput && itemType != responsesInputTypeCustomToolOutput {
 				messages = append(messages, dto.Message{Role: "user", Content: pendingMedia})
 				pendingMedia = nil
@@ -187,10 +210,22 @@ func responsesRequestMessagesToChat(ctx context.Context, req *dto.OpenAIResponse
 				return nil, err
 			}
 			messages = nextMessages
+			if len(messages) > 0 {
+				last := &messages[len(messages)-1]
+				if last.Role == "assistant" && turnReasoning != "" {
+					text := turnReasoning
+					last.ReasoningContent = &text
+				} else if last.Role != "tool" {
+					turnReasoning = ""
+				}
+			}
 			pendingMedia = append(pendingMedia, media...)
 		}
 		if len(pendingMedia) > 0 {
 			messages = append(messages, dto.Message{Role: "user", Content: pendingMedia})
+		}
+		if options != nil && options.RepairToolHistory {
+			messages = repairChatToolHistory(messages)
 		}
 		return messages, nil
 	default:
@@ -204,6 +239,12 @@ func responsesRequestMessagesToChat(ctx context.Context, req *dto.OpenAIResponse
 func responsesInputItemToChatMessages(ctx context.Context, item map[string]any, messages []dto.Message) ([]dto.Message, []any, error) {
 	itemType := strings.TrimSpace(kitutil.Interface2String(item["type"]))
 	switch itemType {
+	case "agent_message":
+		text := responsesAgentMessageText(item["content"])
+		if text == "" {
+			return messages, nil, nil
+		}
+		return append(messages, dto.Message{Role: "user", Content: text}), nil, nil
 	case responsesInputTypeFunctionCall:
 		toolCall, err := responsesFunctionCallItemToChatToolCall(item)
 		if err != nil {
@@ -222,7 +263,10 @@ func responsesInputItemToChatMessages(ctx context.Context, item map[string]any, 
 		return append(messages, dto.Message{Role: "tool", ToolCallId: callID, Content: content}), media, nil
 	}
 
-	role := strings.TrimSpace(kitutil.Interface2String(item["role"]))
+	if itemType != "" && itemType != "message" {
+		return messages, nil, nil
+	}
+	role := strings.ToLower(strings.TrimSpace(kitutil.Interface2String(item["role"])))
 	if role == "" {
 		role = "user"
 	}
@@ -469,6 +513,7 @@ func responsesRequestTextToChatResponseFormat(raw json.RawMessage) (*dto.Respons
 
 	out := &dto.ResponseFormat{Type: formatType}
 	if formatType == "json_schema" {
+		delete(format, "type")
 		schemaRaw, err := kitutil.Marshal(format)
 		if err != nil {
 			return nil, err
@@ -639,10 +684,22 @@ func responseToolOutputToChatContent(value any) any {
 // message and returns the media parts in Chat shape for the caller to hoist into a user message;
 // stringifying them instead would hand base64 image data to the upstream text tokenizer. Any
 // other payload shape (string, object, plain JSON array) keeps the historical stringified form.
+func responsesToolOutputFallback(value any) (any, []any) {
+	raw, _ := kitutil.Marshal(value)
+	if text, parts, changed := tooloutput.Extract(raw); changed {
+		media := make([]any, 0, len(parts))
+		for _, part := range parts {
+			media = append(media, map[string]any{"type": "image_url", "image_url": map[string]any{"url": part.ImageURL.URL}})
+		}
+		return text, media
+	}
+	return responseToolOutputToChatContent(value), nil
+}
+
 func responsesToolOutputToChat(ctx context.Context, value any) (any, []any) {
 	rawParts, ok := value.([]any)
 	if !ok || len(rawParts) == 0 {
-		return responseToolOutputToChatContent(value), nil
+		return responsesToolOutputFallback(value)
 	}
 
 	texts := make([]string, 0, len(rawParts))
@@ -651,13 +708,19 @@ func responsesToolOutputToChat(ctx context.Context, value any) (any, []any) {
 	for _, rawPart := range rawParts {
 		part, ok := rawPart.(map[string]any)
 		if !ok {
-			return responseToolOutputToChatContent(value), nil
+			return responsesToolOutputFallback(value)
 		}
 		partType := strings.TrimSpace(kitutil.Interface2String(part["type"]))
 		switch partType {
 		case "input_text", "output_text", "text":
 			if text := kitutil.Interface2String(part["text"]); text != "" {
 				texts = append(texts, text)
+			}
+		case "image_url":
+			image := map[string]any{"type": "input_image", "image_url": part["image_url"]}
+			mediaParts = append(mediaParts, image)
+			if !slices.Contains(labels, "[image]") {
+				labels = append(labels, "[image]")
 			}
 		case "input_image", "input_file", "input_audio", "input_video":
 			mediaParts = append(mediaParts, part)
@@ -666,7 +729,7 @@ func responsesToolOutputToChat(ctx context.Context, value any) (any, []any) {
 				labels = append(labels, label)
 			}
 		default:
-			return responseToolOutputToChatContent(value), nil
+			return responsesToolOutputFallback(value)
 		}
 	}
 	if len(mediaParts) == 0 {
@@ -675,7 +738,7 @@ func responsesToolOutputToChat(ctx context.Context, value any) (any, []any) {
 
 	converted, err := responsesContentPartsToChatContent(ctx, mediaParts)
 	if err != nil {
-		return responseToolOutputToChatContent(value), nil
+		return responsesToolOutputFallback(value)
 	}
 	media, _ := converted.([]any)
 	if len(texts) == 0 {

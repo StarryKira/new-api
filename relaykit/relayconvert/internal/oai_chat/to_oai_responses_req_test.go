@@ -33,11 +33,13 @@ func TestChatCompletionsRequestToResponsesRequestInstructionsAndTools(t *testing
 	require.NoError(t, err)
 
 	assert.Equal(t, "gpt-test", got.Model)
-	assert.Equal(t, `"system rules\n\ndeveloper rules"`, string(got.Instructions))
-	assert.Equal(t, "input_image", gjson.GetBytes(got.Input, "0.content.1.type").String())
-	assert.Equal(t, "function_call", gjson.GetBytes(got.Input, "2.type").String())
-	assert.Equal(t, "call_1", gjson.GetBytes(got.Input, "2.call_id").String())
-	assert.Equal(t, "function_call_output", gjson.GetBytes(got.Input, "3.type").String())
+	assert.Equal(t, `"system rules"`, string(got.Instructions))
+	assert.Equal(t, "developer", gjson.GetBytes(got.Input, "0.role").String())
+	assert.Equal(t, "developer rules", gjson.GetBytes(got.Input, "0.content").String())
+	assert.Equal(t, "input_image", gjson.GetBytes(got.Input, "1.content.1.type").String())
+	assert.Equal(t, "function_call", gjson.GetBytes(got.Input, "3.type").String())
+	assert.Equal(t, "call_1", gjson.GetBytes(got.Input, "3.call_id").String())
+	assert.Equal(t, "function_call_output", gjson.GetBytes(got.Input, "4.type").String())
 }
 
 func TestChatCompletionsRequestToResponsesRequestPreservesPromptCacheKey(t *testing.T) {

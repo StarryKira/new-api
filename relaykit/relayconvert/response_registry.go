@@ -82,6 +82,9 @@ type ResponseStreamOptions struct {
 	// It is explicit so relaykit callers that depend on the historical zero-value
 	// output are not changed merely by upgrading the module.
 	EmitSequenceNumber bool
+	// RequireTerminalEvent rejects an EOF that was not preceded by a source
+	// terminal event or an explicit transport terminator such as [DONE].
+	RequireTerminalEvent bool
 }
 
 type conversionDiagnosticKey struct {
@@ -99,13 +102,17 @@ type ResponseStreamState struct {
 	Quality   ResponseConverterQuality
 	Steps     []ResponseStep
 
-	specs              []ResponseConverterSpec
-	stepStates         []any
-	usage              *dto.Usage
-	diagnostics        []types.ConversionDiagnostic
-	pendingDiagnostics []types.ConversionDiagnostic
-	seenDiagnostics    map[conversionDiagnosticKey]struct{}
-	fallbackInfo       *convmeta.Values
+	specs                []ResponseConverterSpec
+	stepStates           []any
+	usage                *dto.Usage
+	diagnostics          []types.ConversionDiagnostic
+	pendingDiagnostics   []types.ConversionDiagnostic
+	seenDiagnostics      map[conversionDiagnosticKey]struct{}
+	fallbackInfo         *convmeta.Values
+	requireTerminalEvent bool
+	sourceTerminated     bool
+	transportComplete    bool
+	err                  error
 }
 
 type responseStreamUsageCarrier interface {
@@ -303,8 +310,9 @@ func NewResponseStreamState(from types.RelayFormat, target types.RelayFormat, op
 	}
 	if from == target {
 		return &ResponseStreamState{
-			From: from,
-			To:   target,
+			From:                 from,
+			To:                   target,
+			requireTerminalEvent: options.RequireTerminalEvent,
 		}, nil
 	}
 
@@ -327,6 +335,9 @@ func ConvertStreamResponseChunk(c context.Context, info convmeta.Meta, state *Re
 	if state == nil {
 		return nil, errors.New("response stream state is required")
 	}
+	if state.err != nil {
+		return nil, state.err
+	}
 	if info == nil {
 		if state.fallbackInfo == nil {
 			state.fallbackInfo = &convmeta.Values{}
@@ -340,6 +351,8 @@ func ConvertStreamResponseChunk(c context.Context, info convmeta.Meta, state *Re
 	if from != state.From {
 		return nil, fmt.Errorf("response stream converter %q expects %s response, got %s", state.Converter, state.From, from)
 	}
+	info.EnsureClaudeConvertInfo().RequireTerminalEvent = state.requireTerminalEvent
+	state.sourceTerminated = state.sourceTerminated || sourceStreamHasTerminal(response)
 	diagnostics := toolconv.InspectStreamResponse(state.From, state.To, response)
 	state.rememberDiagnostics(diagnostics)
 	if state.From == state.To {
@@ -351,6 +364,8 @@ func ConvertStreamResponseChunk(c context.Context, info convmeta.Meta, state *Re
 
 	values, usage, err := executeResponseStreamSteps(c, info, state, []any{response}, 0)
 	if err != nil {
+		state.rememberUsage(canonicalUsageFromResponse(response))
+		state.err = err
 		return nil, err
 	}
 	state.rememberUsage(usage)
@@ -360,6 +375,17 @@ func ConvertStreamResponseChunk(c context.Context, info convmeta.Meta, state *Re
 func FinalizeStreamResponse(c context.Context, info convmeta.Meta, state *ResponseStreamState) ([]ResponseResult, error) {
 	if state == nil {
 		return nil, errors.New("response stream state is required")
+	}
+	if state.err != nil {
+		return nil, state.err
+	}
+	if state.requireTerminalEvent && !state.sourceTerminated && !state.transportComplete {
+		state.err = fmt.Errorf("%w: %s stream", ErrIncompleteResponseStream, state.From)
+		return nil, state.err
+	}
+	if err := state.ValidateToolCallArguments(); err != nil {
+		state.err = err
+		return nil, err
 	}
 	if info == nil && state.fallbackInfo != nil {
 		info = state.fallbackInfo
@@ -380,6 +406,7 @@ func FinalizeStreamResponse(c context.Context, info convmeta.Meta, state *Respon
 	for i, spec := range state.specs {
 		finalValues, stepUsage, err := finalizeResponseStreamStep(c, info, spec, state.stepStates[i])
 		if err != nil {
+			state.err = err
 			return nil, err
 		}
 		if stepUsage != nil {
@@ -391,6 +418,7 @@ func FinalizeStreamResponse(c context.Context, info convmeta.Meta, state *Respon
 		}
 		current, currentUsage, err := executeResponseStreamSteps(c, info, state, finalValues, i+1)
 		if err != nil {
+			state.err = err
 			return nil, err
 		}
 		if currentUsage != nil {
@@ -440,7 +468,14 @@ func (s *ResponseStreamState) FailResponsesStream(code string, message string, p
 		return nil, false
 	}
 	for _, state := range s.stepStates {
-		if streamState, ok := state.(*ChatToResponsesStreamState); ok {
+		var streamState *ChatToResponsesStreamState
+		switch typed := state.(type) {
+		case *ChatToResponsesStreamState:
+			streamState = typed
+		case *claudemessages.ClaudeToResponsesStreamState:
+			streamState = typed.Chat
+		}
+		if streamState != nil {
 			events := streamState.Fail(code, message, param)
 			return responseStreamResults(s, streamValuesFromAny(events), s.Usage(), s.takeDiagnostics(len(events) > 0)), true
 		}
@@ -594,13 +629,14 @@ func newResponseStreamStateFromSpec(from types.RelayFormat, target types.RelayFo
 		})
 	}
 	return &ResponseStreamState{
-		From:       from,
-		To:         target,
-		Converter:  spec.ID,
-		Quality:    spec.Quality,
-		Steps:      resultSteps,
-		specs:      steps,
-		stepStates: stepStates,
+		From:                 from,
+		To:                   target,
+		Converter:            spec.ID,
+		Quality:              spec.Quality,
+		Steps:                resultSteps,
+		specs:                steps,
+		stepStates:           stepStates,
+		requireTerminalEvent: options.RequireTerminalEvent,
 	}, nil
 }
 
@@ -867,10 +903,11 @@ func canonicalUsageFromResponse(response any) *dto.Usage {
 	case *dto.OpenAIResponsesResponse:
 		return UsageFromResponsesUsage(resp.Usage)
 	case *dto.ResponsesStreamResponse:
-		if resp.Response == nil {
-			return nil
+		usage := UsageFromResponsesUsage(resp.Usage)
+		if resp.Response != nil {
+			usage = dto.MergeUsageNonZero(usage, UsageFromResponsesUsage(resp.Response.Usage))
 		}
-		return UsageFromResponsesUsage(resp.Response.Usage)
+		return usage
 	case *dto.ClaudeResponse:
 		return usageFromClaudeResponse(resp)
 	case *dto.GeminiChatResponse:
@@ -902,6 +939,15 @@ func convertOAIChatResponseToOAIResponses(_ context.Context, info convmeta.Meta,
 	if id == "" {
 		id = fmt.Sprintf("resp_%s", kitutil.GetUUID())
 	}
+	if convmeta.OptionsOf(info).ReasoningOnlyAsText && len(chatResponse.Choices) > 0 {
+		choice := chatResponse.Choices[0]
+		if choice.Message.StringContent() == "" && len(choice.Message.ParseToolCalls()) == 0 && strings.TrimSpace(choice.Message.GetReasoningContent()) != "" {
+			copy := *chatResponse
+			copy.Choices = append([]dto.OpenAITextResponseChoice(nil), chatResponse.Choices...)
+			copy.Choices[0].Message.Content = choice.Message.GetReasoningContent()
+			chatResponse = &copy
+		}
+	}
 	return oaichat.ChatCompletionsResponseToResponsesResponseWithTools(chatResponse, id, convmeta.ResponsesToolStateOf(info))
 }
 
@@ -917,12 +963,12 @@ func convertOAIResponsesResponseToOAIChat(_ context.Context, _ convmeta.Meta, re
 	return ResponsesResponseToChatCompletionsResponse(responsesResponse, id)
 }
 
-func convertOAIResponsesResponseToClaudeMessages(_ context.Context, _ convmeta.Meta, response any) (any, *dto.Usage, error) {
+func convertOAIResponsesResponseToClaudeMessages(_ context.Context, info convmeta.Meta, response any) (any, *dto.Usage, error) {
 	responsesResponse, err := asOAIResponsesResponse(response)
 	if err != nil {
 		return nil, nil, err
 	}
-	return oairesponses.ResponsesResponseToClaudeMessagesResponse(responsesResponse)
+	return oairesponses.ResponsesResponseToClaudeMessagesResponseWithPolicy(responsesResponse, convmeta.OptionsOf(info).Claude.ClaudeCodeReadEmptyPages)
 }
 
 func newOAIChatToOAIResponsesStreamState(options ResponseStreamOptions) any {
@@ -947,6 +993,7 @@ func convertOAIChatStreamResponseToOAIResponses(_ context.Context, info convmeta
 	if !ok || streamState == nil {
 		return nil, nil, errors.New("OAI chat to OAI responses stream state is required")
 	}
+	streamState.ReasoningOnlyAsText = convmeta.OptionsOf(info).ReasoningOnlyAsText
 	if streamState.Tools == nil {
 		streamState.Tools = convmeta.ResponsesToolStateOf(info)
 	}
@@ -1017,6 +1064,7 @@ func convertOAIResponsesStreamResponseToClaudeMessages(_ context.Context, info c
 	if info != nil {
 		estimatedInputTokens = info.GetEstimatePromptTokens()
 	}
+	streamState.ClaudeCodeReadEmptyPages = convmeta.OptionsOf(info).Claude.ClaudeCodeReadEmptyPages
 	responses, usage, err := streamState.ConvertChunk(responsesResponse, estimatedInputTokens)
 	if err != nil {
 		return nil, usage, err
@@ -1063,16 +1111,39 @@ func convertOAIChatStreamResponseToClaudeMessages(_ context.Context, info convme
 	if err != nil {
 		return nil, nil, err
 	}
-	return StreamResponseOpenAI2Claude(chatResponse, info), canonicalUsageFromResponse(chatResponse), nil
+	responses := StreamResponseOpenAI2Claude(chatResponse, info)
+	for _, choice := range chatResponse.Choices {
+		if choice.FinishReason != nil && *choice.FinishReason != "" {
+			if err := validateClaudeStreamToolNames(info); err != nil {
+				return nil, nil, err
+			}
+		}
+	}
+	return responses, canonicalUsageFromResponse(chatResponse), nil
 }
 
 func finalizeOAIChatStreamResponseToClaudeMessages(_ context.Context, info convmeta.Meta, _ any) ([]any, *dto.Usage, error) {
 	if info == nil {
 		info = &convmeta.Values{}
 	}
+	if err := validateClaudeStreamToolNames(info); err != nil {
+		return nil, nil, err
+	}
 	usage := info.EnsureClaudeConvertInfo().Usage
 	responses := oaichat.FinalizeStreamResponseOpenAI2Claude(info)
 	return streamValuesFromAny(responses), usage, nil
+}
+
+func validateClaudeStreamToolNames(info convmeta.Meta) error {
+	if info == nil {
+		return nil
+	}
+	for _, tool := range info.EnsureClaudeConvertInfo().ToolCalls {
+		if tool != nil && strings.TrimSpace(tool.Name) == "" {
+			return fmt.Errorf("tool call %q is missing a function name", tool.ID)
+		}
+	}
+	return nil
 }
 
 func convertOAIChatResponseToGeminiChat(_ context.Context, info convmeta.Meta, response any) (any, *dto.Usage, error) {
@@ -1207,6 +1278,7 @@ func convertGeminiChatStreamResponseChunkToOAIChat(_ context.Context, info convm
 	if info != nil && info.HasChannelMeta() {
 		model = info.GetUpstreamModelName()
 	}
+	streamState.SetCumulativeText(convmeta.OptionsOf(info).Gemini.CumulativeStreamText)
 	responses, err := streamState.ConvertChunk(geminiResponse, model, usage)
 	if err != nil {
 		return nil, nil, err
@@ -1319,4 +1391,71 @@ func asGeminiChatResponse(response any) (*dto.GeminiChatResponse, error) {
 	default:
 		return nil, fmt.Errorf("expected Gemini chat response, got %T", response)
 	}
+}
+
+func convertClaudeResponseToOAIResponses(_ context.Context, info convmeta.Meta, response any) (any, *dto.Usage, error) {
+	value, err := asClaudeResponse(response)
+	if err != nil {
+		return nil, nil, err
+	}
+	return claudemessages.ClaudeResponseToResponses(value, convmeta.ResponsesToolStateOf(info))
+}
+func newClaudeToOAIResponsesStreamState(options ResponseStreamOptions) any {
+	state := claudemessages.NewClaudeToResponsesStreamState(options.ID, options.Model)
+	state.Chat.EmitSequenceNumber = options.EmitSequenceNumber
+	if options.Created != 0 {
+		state.Chat.Created = options.Created
+	}
+	return state
+}
+func convertClaudeStreamToOAIResponses(_ context.Context, info convmeta.Meta, response any, state any) ([]any, *dto.Usage, error) {
+	value, err := asClaudeResponse(response)
+	if err != nil {
+		return nil, nil, err
+	}
+	stream, ok := state.(*claudemessages.ClaudeToResponsesStreamState)
+	if !ok || stream == nil {
+		return nil, nil, errors.New("Claude to Responses stream state is required")
+	}
+	stream.Chat.Tools = convmeta.ResponsesToolStateOf(info)
+	usage := value.Usage
+	if usage == nil && value.Message != nil {
+		usage = value.Message.Usage
+	}
+	if usage != nil {
+		stream.NativeUsage = dto.MergeClaudeUsageNonZero(stream.NativeUsage, usage)
+		stream.Chat.Usage = oaichat.UsageFromChatUsage(claudemessages.UsageFromClaudeAPIUsage(stream.NativeUsage))
+	}
+	events, err := stream.ConvertChunk(value)
+	return streamValuesFromAny(events), stream.Chat.Usage, err
+}
+func finalizeClaudeToOAIResponsesStream(_ context.Context, _ convmeta.Meta, state any) ([]any, *dto.Usage, error) {
+	stream, ok := state.(*claudemessages.ClaudeToResponsesStreamState)
+	if !ok || stream == nil {
+		return nil, nil, errors.New("Claude to Responses stream state is required")
+	}
+	events, err := stream.CloseThinking()
+	if err != nil {
+		return nil, nil, err
+	}
+	events = append(events, oaichat.FinalizeChatCompletionsStreamToResponses(stream.Chat)...)
+	return streamValuesFromAny(events), stream.Chat.Usage, nil
+}
+
+func (s *ResponseStreamState) ValidateToolCallArguments() error {
+	if s == nil {
+		return nil
+	}
+	for _, state := range s.stepStates {
+		if native, ok := state.(*claudemessages.ClaudeToResponsesStreamState); ok {
+			if err := native.Chat.ValidateToolCallArguments(); err != nil {
+				return err
+			}
+		} else if validator, ok := state.(interface{ ValidateToolCallArguments() error }); ok {
+			if err := validator.ValidateToolCallArguments(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

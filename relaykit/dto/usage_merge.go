@@ -157,7 +157,15 @@ func MergeClaudeUsageNonZero(current *ClaudeUsage, incoming *ClaudeUsage) *Claud
 		}
 		return merged
 	}
-	if incoming.InputTokens > 0 {
+	if incoming.Speed != "" {
+		merged.Speed = incoming.Speed
+	}
+	if incoming.inputTokensAuthoritative {
+		merged.InputTokens = incoming.InputTokens
+		merged.CacheReadInputTokens = incoming.CacheReadInputTokens
+		merged.CacheCreationInputTokens = incoming.CacheCreationInputTokens
+		merged.inputTokensAuthoritative = true
+	} else if incoming.InputTokens > 0 {
 		merged.InputTokens = incoming.InputTokens
 	}
 	if incoming.CacheCreationInputTokens > 0 {

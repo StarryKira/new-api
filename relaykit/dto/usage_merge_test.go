@@ -3,6 +3,7 @@ package dto
 import (
 	"testing"
 
+	"github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -289,4 +290,26 @@ func TestMergeUsageNonZeroKeepsPositiveValuesAndTakesMaxTotal(t *testing.T) {
 	assert.Equal(t, 10, merged.PromptTokens)
 	assert.Equal(t, 5, merged.CompletionTokens)
 	assert.Equal(t, 20, merged.TotalTokens)
+}
+
+func TestClaudeCompatibleUsageAliases(t *testing.T) {
+	for _, body := range []string{
+		`{"input_tokens":100,"prompt_tokens":100,"cached_tokens":30,"cache_creation_input_tokens":10}`,
+		`{"input_tokens":100,"prompt_cache_miss_tokens":60,"prompt_cache_hit_tokens":30,"cache_creation_input_tokens":10}`,
+		`{"input_tokens":100,"prompt_tokens":100,"prompt_tokens_details":{"cached_tokens":30},"cache_creation_input_tokens":10}`,
+	} {
+		var usage ClaudeUsage
+		require.NoError(t, kitutil.Unmarshal([]byte(body), &usage))
+		require.Equal(t, 60, usage.InputTokens)
+		require.Equal(t, 30, usage.CacheReadInputTokens)
+		require.Equal(t, 10, usage.CacheCreationInputTokens)
+	}
+	var zero ClaudeUsage
+	require.NoError(t, kitutil.Unmarshal([]byte(`{"prompt_cache_miss_tokens":0,"prompt_cache_hit_tokens":0}`), &zero))
+	merged := MergeClaudeUsageNonZero(&ClaudeUsage{InputTokens: 100, CacheReadInputTokens: 30, CacheCreationInputTokens: 10}, &zero)
+	require.Zero(t, merged.InputTokens)
+	require.Zero(t, merged.CacheReadInputTokens)
+	require.Zero(t, merged.CacheCreationInputTokens)
+	independent := MergeClaudeUsageNonZero(&ClaudeUsage{InputTokens: 20}, &ClaudeUsage{CacheReadInputTokens: 11, CacheCreationInputTokens: 4})
+	require.Equal(t, 20, independent.InputTokens)
 }

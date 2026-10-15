@@ -9,7 +9,7 @@
   "output": [
     {
       "type": "message",
-      "id": "msg_fixed_msg_0",
+      "id": "msg_fixed_item_0_msg_0",
       "status": "completed",
       "role": "assistant",
       "content": [

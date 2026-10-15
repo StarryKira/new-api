@@ -7,6 +7,7 @@ package kitutil
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"unsafe"
 )
@@ -132,4 +133,26 @@ func Any2Type[T any](data any) (T, error) {
 		return zero, err
 	}
 	return res, nil
+}
+
+// UnmarshalUseNumber preserves JSON numeric lexemes in native dialect rewrites.
+// It validates a single JSON value before decoding with Number values.
+func UnmarshalUseNumber(data []byte, value any) error {
+	if !Valid(data) {
+		return fmt.Errorf("invalid JSON value")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	return decoder.Decode(value)
+}
+
+// MarshalWithoutHTMLEscape keeps native JSON string spelling in dialect rewrites.
+func MarshalWithoutHTMLEscape(value any) ([]byte, error) {
+	var out bytes.Buffer
+	encoder := json.NewEncoder(&out)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(out.Bytes(), []byte("\n")), nil
 }

@@ -189,18 +189,18 @@ func TestChatCompletionsStreamToResponsesEventsAggregatesUsageAndToolArgs(t *tes
 	})...)
 	events = append(events, FinalizeChatCompletionsStreamToResponses(state)...)
 
-	require.Len(t, events, 10)
+	require.Len(t, events, 12)
 	assert.Equal(t, responsesEventCreated, events[0].Type)
-	assert.Equal(t, responsesEventOutputTextDelta, events[2].Type)
-	assert.Equal(t, "hello", events[2].Payload.Delta)
-	assert.Equal(t, responsesEventFunctionArgsDelta, events[4].Type)
-	assert.Equal(t, `{"q":"x"}`, events[4].Payload.Delta)
-	assert.Equal(t, responsesEventCompleted, events[9].Type)
-	require.NotNil(t, events[9].Payload.Response)
-	assert.Equal(t, 6, events[9].Payload.Response.Usage.TotalTokens)
-	require.Len(t, events[9].Payload.Response.Output, 2)
-	assert.Equal(t, "hello", events[9].Payload.Response.Output[0].Content[0].Text)
-	assert.Equal(t, `"{\"q\":\"x\"}"`, string(events[9].Payload.Response.Output[1].Arguments))
+	assert.Equal(t, responsesEventOutputTextDelta, events[3].Type)
+	assert.Equal(t, "hello", events[3].Payload.Delta)
+	assert.Equal(t, responsesEventFunctionArgsDelta, events[5].Type)
+	assert.Equal(t, `{"q":"x"}`, events[5].Payload.Delta)
+	assert.Equal(t, responsesEventCompleted, events[11].Type)
+	require.NotNil(t, events[11].Payload.Response)
+	assert.Equal(t, 6, events[11].Payload.Response.Usage.TotalTokens)
+	require.Len(t, events[11].Payload.Response.Output, 2)
+	assert.Equal(t, "hello", events[11].Payload.Response.Output[0].Content[0].Text)
+	assert.Equal(t, `"{\"q\":\"x\"}"`, string(events[11].Payload.Response.Output[1].Arguments))
 }
 
 func TestChatCompletionsStreamToResponsesEmitsReasoningSummaryPartLifecycle(t *testing.T) {
@@ -232,8 +232,10 @@ func TestChatCompletionsStreamToResponsesEmitsReasoningSummaryPartLifecycle(t *t
 		responsesEventReasoningSummaryPartAdded,
 		responsesEventReasoningSummaryDelta,
 		responsesEventOutputItemAdded,
+		"response.content_part.added",
 		responsesEventOutputTextDelta,
 		"response.output_text.done",
+		"response.content_part.done",
 		responsesEventOutputItemDone,
 		responsesEventReasoningSummaryDone,
 		responsesEventReasoningSummaryPartDone,
@@ -248,7 +250,7 @@ func TestChatCompletionsStreamToResponsesEmitsReasoningSummaryPartLifecycle(t *t
 	require.NotNil(t, partAdded.Part)
 	assert.Equal(t, dto.ResponsesReasoningSummaryPart{Type: "summary_text"}, *partAdded.Part)
 
-	partDone := events[9].Payload
+	partDone := events[11].Payload
 	assert.Equal(t, "resp_1_reasoning_0", partDone.ItemID)
 	require.NotNil(t, partDone.Part)
 	assert.Equal(t, dto.ResponsesReasoningSummaryPart{Type: "summary_text", Text: "think"}, *partDone.Part)

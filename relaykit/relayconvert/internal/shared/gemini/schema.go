@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -41,17 +42,18 @@ var geminiOpenAPISchemaAllowedFields = map[string]struct{}{
 
 const geminiFunctionSchemaMaxDepth = 64
 
-func CleanFunctionParameters(params interface{}) interface{} {
-	return cleanGeminiFunctionParametersWithDepth(params, 0)
+func CleanFunctionParameters(params interface{}, stringifyScalarEnums ...bool) interface{} {
+	stringify := len(stringifyScalarEnums) > 0 && stringifyScalarEnums[0]
+	return cleanGeminiFunctionParametersWithDepth(params, 0, stringify)
 }
 
-func cleanGeminiFunctionParametersWithDepth(params interface{}, depth int) interface{} {
+func cleanGeminiFunctionParametersWithDepth(params interface{}, depth int, stringify bool) interface{} {
 	if params == nil {
 		return nil
 	}
 
 	if depth >= geminiFunctionSchemaMaxDepth {
-		return cleanGeminiFunctionParametersShallow(params)
+		return cleanGeminiFunctionParametersShallow(params, stringify)
 	}
 
 	switch v := params.(type) {
@@ -63,28 +65,33 @@ func cleanGeminiFunctionParametersWithDepth(params interface{}, depth int) inter
 			}
 		}
 
+		normalizeGeminiConst(v, cleanedMap)
 		normalizeGeminiSchemaTypeAndNullable(cleanedMap)
+		normalizeIntegerExclusiveMinimum(v, cleanedMap)
+		if stringify {
+			stringifyGeminiEnum(cleanedMap)
+		}
 		sanitizeGeminiEnum(cleanedMap)
 
 		if props, ok := cleanedMap["properties"].(map[string]interface{}); ok && props != nil {
 			cleanedProps := make(map[string]interface{})
 			for propName, propValue := range props {
-				cleanedProps[propName] = cleanGeminiFunctionParametersWithDepth(propValue, depth+1)
+				cleanedProps[propName] = cleanGeminiFunctionParametersWithDepth(propValue, depth+1, stringify)
 			}
 			cleanedMap["properties"] = cleanedProps
 		}
 
 		if items, ok := cleanedMap["items"].(map[string]interface{}); ok && items != nil {
-			cleanedMap["items"] = cleanGeminiFunctionParametersWithDepth(items, depth+1)
+			cleanedMap["items"] = cleanGeminiFunctionParametersWithDepth(items, depth+1, stringify)
 		}
 		if itemsArray, ok := cleanedMap["items"].([]interface{}); ok && len(itemsArray) > 0 {
-			cleanedMap["items"] = cleanGeminiFunctionParametersWithDepth(itemsArray[0], depth+1)
+			cleanedMap["items"] = cleanGeminiFunctionParametersWithDepth(itemsArray[0], depth+1, stringify)
 		}
 
 		if nested, ok := cleanedMap["anyOf"].([]interface{}); ok && nested != nil {
 			cleanedNested := make([]interface{}, len(nested))
 			for i, item := range nested {
-				cleanedNested[i] = cleanGeminiFunctionParametersWithDepth(item, depth+1)
+				cleanedNested[i] = cleanGeminiFunctionParametersWithDepth(item, depth+1, stringify)
 			}
 			cleanedMap["anyOf"] = cleanedNested
 		}
@@ -93,7 +100,7 @@ func cleanGeminiFunctionParametersWithDepth(params interface{}, depth int) inter
 	case []interface{}:
 		cleanedArray := make([]interface{}, len(v))
 		for i, item := range v {
-			cleanedArray[i] = cleanGeminiFunctionParametersWithDepth(item, depth+1)
+			cleanedArray[i] = cleanGeminiFunctionParametersWithDepth(item, depth+1, stringify)
 		}
 		return cleanedArray
 	default:
@@ -101,7 +108,7 @@ func cleanGeminiFunctionParametersWithDepth(params interface{}, depth int) inter
 	}
 }
 
-func cleanGeminiFunctionParametersShallow(params interface{}) interface{} {
+func cleanGeminiFunctionParametersShallow(params interface{}, stringify bool) interface{} {
 	switch v := params.(type) {
 	case map[string]interface{}:
 		cleanedMap := make(map[string]interface{}, len(v))
@@ -110,7 +117,12 @@ func cleanGeminiFunctionParametersShallow(params interface{}) interface{} {
 				cleanedMap[key] = val
 			}
 		}
+		normalizeGeminiConst(v, cleanedMap)
 		normalizeGeminiSchemaTypeAndNullable(cleanedMap)
+		normalizeIntegerExclusiveMinimum(v, cleanedMap)
+		if stringify {
+			stringifyGeminiEnum(cleanedMap)
+		}
 		sanitizeGeminiEnum(cleanedMap)
 		delete(cleanedMap, "properties")
 		delete(cleanedMap, "items")
@@ -121,6 +133,99 @@ func cleanGeminiFunctionParametersShallow(params interface{}) interface{} {
 	default:
 		return params
 	}
+}
+
+func normalizeIntegerExclusiveMinimum(source, schema map[string]any) {
+	if schema["type"] != "INTEGER" {
+		return
+	}
+	number := func(v any) (float64, bool) {
+		var f float64
+		switch n := v.(type) {
+		case float64:
+			f = n
+		case int:
+			f = float64(n)
+		case int64:
+			f = float64(n)
+		case json.Number:
+			var err error
+			f, err = n.Float64()
+			if err != nil {
+				return 0, false
+			}
+		default:
+			return 0, false
+		}
+		return f, !math.IsNaN(f) && !math.IsInf(f, 0)
+	}
+	bound, ok := number(source["exclusiveMinimum"])
+	if !ok || math.Trunc(bound) != bound || bound+1 <= bound {
+		return
+	}
+	bound++
+	if current, ok := number(schema["minimum"]); !ok || current < bound {
+		schema["minimum"] = bound
+	}
+}
+
+func stringifyGeminiEnum(schema map[string]any) {
+	values, ok := schema["enum"].([]any)
+	if !ok {
+		return
+	}
+	normalized := make([]any, len(values))
+	for i, value := range values {
+		switch value.(type) {
+		case string:
+			normalized[i] = value
+		case nil, bool, float64, float32, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, json.Number:
+			data, err := kitutil.Marshal(value)
+			if err != nil {
+				delete(schema, "enum")
+				return
+			}
+			normalized[i] = string(data)
+		default:
+			delete(schema, "enum")
+			return
+		}
+	}
+	schema["enum"] = normalized
+}
+
+// normalizeGeminiConst preserves string singleton constraints using the
+// equivalent enum representation supported by Gemini's typed Schema.
+func normalizeGeminiConst(source, schema map[string]any) {
+	value, ok := source["const"].(string)
+	if !ok {
+		return
+	}
+	if _, exists := schema["type"]; !exists {
+		schema["type"] = "string"
+	}
+	values := []any{value}
+	if raw, exists := source["enum"]; exists {
+		match := false
+		switch enum := raw.(type) {
+		case []any:
+			for _, item := range enum {
+				if item == value {
+					match = true
+				}
+			}
+		case []string:
+			for _, item := range enum {
+				if item == value {
+					match = true
+				}
+			}
+		}
+		if !match {
+			values = []any{}
+		}
+	}
+	schema["enum"] = values
 }
 
 // sanitizeGeminiEnum keeps the enum constraint only when every element is a
@@ -215,7 +320,7 @@ func normalizeGeminiSchemaTypeAndNullable(schema map[string]interface{}) {
 // other schema goes unchanged to parametersJsonSchema when jsonSchema is
 // true; otherwise it is cleaned anyway and misfits names what the typed
 // Schema cannot carry.
-func FunctionParameters(schema any, jsonSchema bool) (field string, value any, misfits []string) {
+func FunctionParameters(schema any, jsonSchema bool, stringifyScalarEnums ...bool) (field string, value any, misfits []string) {
 	misfits = schemaMisfits(schema)
 	object, _ := schema.(map[string]any)
 	properties, hasProperties := object["properties"].(map[string]any)
@@ -242,7 +347,7 @@ func FunctionParameters(schema any, jsonSchema bool) (field string, value any, m
 	if emptyObject {
 		return "parameters", nil, misfits
 	}
-	return "parameters", CleanFunctionParameters(schema), misfits
+	return "parameters", CleanFunctionParameters(schema, stringifyScalarEnums...), misfits
 }
 
 // ApplyResponseSchema sets the structured output schema from the json_schema
@@ -309,6 +414,11 @@ func collectSchemaMisfits(schema any, depth int, found map[string]struct{}) {
 	}
 	for key, item := range value {
 		if _, allowed := geminiOpenAPISchemaAllowedFields[key]; !allowed {
+			if key == "const" {
+				if _, ok := item.(string); ok {
+					continue
+				}
+			}
 			if key != "additionalProperties" && key != "$schema" {
 				found[key] = struct{}{}
 			}

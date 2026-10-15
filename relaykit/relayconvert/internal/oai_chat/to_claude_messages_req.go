@@ -1,9 +1,8 @@
 package oaichat
 
 import (
-	"fmt"
-
 	"context"
+	"fmt"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
@@ -148,8 +147,11 @@ func OpenAIChatRequestToClaudeMessages(c context.Context, info convmeta.Meta, te
 			message.Role = "user"
 		}
 		fmtMessage := dto.Message{
-			Role:    message.Role,
-			Content: message.Content,
+			Role:               message.Role,
+			Content:            message.Content,
+			ReasoningContent:   message.ReasoningContent,
+			Reasoning:          message.Reasoning,
+			ReasoningSignature: message.ReasoningSignature,
 		}
 		if message.Role == "tool" {
 			fmtMessage.ToolCallId = message.ToolCallId
@@ -157,13 +159,13 @@ func OpenAIChatRequestToClaudeMessages(c context.Context, info convmeta.Meta, te
 		if message.Role == "assistant" && message.ToolCalls != nil {
 			fmtMessage.ToolCalls = message.ToolCalls
 		}
-		if lastMessage.Role == message.Role && lastMessage.Role != "tool" {
+		if lastMessage.Role == message.Role && lastMessage.Role != "tool" && lastMessage.ReasoningSignature == "" && message.ReasoningSignature == "" {
 			if lastMessage.IsStringContent() && message.IsStringContent() {
 				fmtMessage.SetStringContent(fmt.Sprintf("%s %s", lastMessage.StringContent(), message.StringContent()))
 				formatMessages = formatMessages[:len(formatMessages)-1]
 			}
 		}
-		if fmtMessage.Content == nil || (fmtMessage.IsStringContent() && fmtMessage.StringContent() == "") {
+		if (fmtMessage.Content == nil || (fmtMessage.IsStringContent() && fmtMessage.StringContent() == "")) && fmtMessage.ReasoningSignature == "" {
 			fmtMessage.SetStringContent("...")
 		}
 		formatMessages = append(formatMessages, fmtMessage)
@@ -243,7 +245,7 @@ func OpenAIChatRequestToClaudeMessages(c context.Context, info convmeta.Meta, te
 					Content:   message.Content,
 				},
 			}
-		} else if message.IsStringContent() && message.ToolCalls == nil {
+		} else if message.IsStringContent() && message.ToolCalls == nil && message.ReasoningSignature == "" {
 			text := message.StringContent()
 			if text == "" {
 				text = "..."
@@ -251,6 +253,10 @@ func OpenAIChatRequestToClaudeMessages(c context.Context, info convmeta.Meta, te
 			claudeMessage.Content = text
 		} else {
 			claudeMediaMessages := make([]dto.ClaudeMediaMessage, 0)
+			if message.Role == "assistant" && message.ReasoningSignature != "" {
+				text := message.GetReasoningContent()
+				claudeMediaMessages = append(claudeMediaMessages, dto.ClaudeMediaMessage{Type: "thinking", Thinking: &text, Signature: message.ReasoningSignature})
+			}
 			for _, mediaMessage := range message.ParseContent() {
 				switch mediaMessage.Type {
 				case "text":
@@ -263,6 +269,10 @@ func OpenAIChatRequestToClaudeMessages(c context.Context, info convmeta.Meta, te
 				default:
 					source := mediaMessage.ToFileSource()
 					if source == nil {
+						continue
+					}
+					if mediaMessage.Type == dto.ContentTypeImageURL && source.IsURL() {
+						claudeMediaMessages = append(claudeMediaMessages, dto.ClaudeMediaMessage{Type: "image", Source: &dto.ClaudeMessageSource{Type: "url", Url: source.GetRawData()}})
 						continue
 					}
 					// Claude content blocks carry images, PDF documents, and text
@@ -298,11 +308,14 @@ func OpenAIChatRequestToClaudeMessages(c context.Context, info convmeta.Meta, te
 							kitutil.LogInfo("tool call function arguments is not a map[string]any: " + fmt.Sprintf("%v", toolCall.Function.Arguments))
 						}
 					}
+					var signature string
+					_ = kitutil.Unmarshal(toolCall.ExtraContent.ThoughtSignature(), &signature)
 					claudeMediaMessages = append(claudeMediaMessages, dto.ClaudeMediaMessage{
-						Type:  "tool_use",
-						Id:    toolCall.ID,
-						Name:  toolCall.Function.Name,
-						Input: inputObj,
+						Signature: signature,
+						Type:      "tool_use",
+						Id:        toolCall.ID,
+						Name:      toolCall.Function.Name,
+						Input:     inputObj,
 					})
 				}
 			}

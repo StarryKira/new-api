@@ -56,6 +56,9 @@ func extractOpenAIChatRequest(request any) (any, Set, error) {
 	}
 	for index, tool := range source.Tools {
 		if tool.Type == "function" || tool.Type == "" {
+			if strings.TrimSpace(tool.Function.Name) == "" {
+				return nil, Set{}, fmt.Errorf("tools[%d] function name is required", index)
+			}
 			if definition, ok := decodeOpenAIChatPseudoHostedTool(tool.Function.Name); ok {
 				set.Definitions = append(set.Definitions, definition)
 				continue
@@ -72,10 +75,20 @@ func extractOpenAIChatRequest(request any) (any, Set, error) {
 			})
 			continue
 		}
-		if len(tool.Custom) == 0 {
-			return nil, Set{}, fmt.Errorf("tools[%d] has unsupported type %q without a native payload", index, tool.Type)
+		rawTool := tool.Native
+		if len(rawTool) == 0 {
+			rawTool = tool.Custom
 		}
-		definition, err := decodeOpenAIResponsesDefinition(tool.Custom)
+		if len(rawTool) == 0 {
+			// Some Chat-compatible providers accept these hosted-tool shorthands.
+			// Decode them into the shared tool representation before target policy.
+			if isOpenAIResponsesWebSearchType(tool.Type) || tool.Type == "code_execution" || tool.Type == "code_interpreter" {
+				rawTool, _ = kitutil.Marshal(map[string]any{"type": tool.Type})
+			} else {
+				return nil, Set{}, fmt.Errorf("tools[%d] has unsupported type %q without a native payload", index, tool.Type)
+			}
+		}
+		definition, err := decodeOpenAIResponsesDefinition(rawTool)
 		if err != nil {
 			return nil, Set{}, fmt.Errorf("tools[%d]: %w", index, err)
 		}
@@ -116,6 +129,11 @@ func extractOpenAIChatRequest(request any) (any, Set, error) {
 	}
 
 	clone := *source
+	var err error
+	clone.Messages, err = normalizeLegacyChatMessages(source.Messages)
+	if err != nil {
+		return nil, Set{}, err
+	}
 	clone.Tools = nil
 	clone.ToolChoice = nil
 	clone.WebSearchOptions = nil
@@ -162,25 +180,47 @@ func extractOpenAIResponsesRequest(request any) (any, Set, error) {
 	}
 	set.Definitions = append(set.Definitions, additionalDefinitions...)
 	set.Diagnostics = append(set.Diagnostics, additionalDiagnostics...)
+	input, err = normalizeResponsesToolSearch(input, &set)
+	if err != nil {
+		return nil, Set{}, err
+	}
+	if ResponsesHasToolSearch(set) {
+		for _, definition := range set.Definitions {
+			if definition.NativeType != "tool_search" && (definition.Name == convmeta.ToolSearchFunctionName || definition.Function != nil && definition.Function.Name == convmeta.ToolSearchFunctionName) {
+				return nil, Set{}, fmt.Errorf("tool name %q conflicts with client tool_search", convmeta.ToolSearchFunctionName)
+			}
+		}
+	}
 	// Flattened namespace names can collide with other tools.
-	seenNames := make(map[string]struct{}, len(set.Definitions))
+	seenNames := make(map[string]Definition, len(set.Definitions))
 	seenNamespaces := make(map[string]struct{})
+	seenSearch := false
 	definitions := set.Definitions[:0]
 	for _, definition := range set.Definitions {
+		if definition.NativeType == "tool_search" {
+			if seenSearch {
+				continue
+			}
+			seenSearch = true
+		}
 		if _, seen := seenNamespaces[definition.Namespace]; !seen && definition.Namespace != "" && definition.Namespace != convmeta.DefaultResponsesToolNamespace {
 			seenNamespaces[definition.Namespace] = struct{}{}
 			set.Diagnostics = append(set.Diagnostics, presentationLoss("tools", "tool_namespace_flattened",
 				fmt.Sprintf("tools in namespace %q are sent as functions named %q", definition.Namespace, convmeta.NamespacedToolName(definition.Namespace, "<name>"))))
 		}
 		name := definition.Name
-		_, duplicate := seenNames[name]
-		if definition.Namespace != "" && name != "" && duplicate {
-			set.Diagnostics = append(set.Diagnostics, semanticLoss("tools", "namespaced_tool_dropped",
-				fmt.Sprintf("tool %q from namespace %q shares its flattened name with another tool and was omitted", name, definition.Namespace)))
-			continue
+		existing, duplicate := seenNames[name]
+		if name != "" && duplicate && definition.Namespace == "" && existing.Namespace == "" && (definition.Kind == KindFunction || definition.NativeType == "custom") {
+			return nil, Set{}, fmt.Errorf("tool %q is declared more than once; cannot disambiguate calls", name)
+		}
+		if name != "" && duplicate && (definition.Namespace != "" || existing.Namespace != "") {
+			if sameDiscoveredDefinition(existing, definition) {
+				continue
+			}
+			return nil, Set{}, fmt.Errorf("tool %q has ambiguous namespace declarations", name)
 		}
 		if name != "" {
-			seenNames[name] = struct{}{}
+			seenNames[name] = definition
 		}
 		definitions = append(definitions, definition)
 	}
@@ -254,6 +294,7 @@ func decodeOpenAIResponsesDefinitions(raw json.RawMessage) ([]Definition, error)
 		Name        string           `json:"name"`
 		Description string           `json:"description"`
 		Tools       []map[string]any `json:"tools"`
+		Children    []map[string]any `json:"children"`
 	}
 	if err := kitutil.Unmarshal(raw, &namespace); err != nil || strings.TrimSpace(namespace.Type) != "namespace" {
 		definition, err := decodeOpenAIResponsesDefinition(raw)
@@ -265,6 +306,9 @@ func decodeOpenAIResponsesDefinitions(raw json.RawMessage) ([]Definition, error)
 	namespaceName := strings.TrimSpace(namespace.Name)
 	if namespaceName == "" {
 		return nil, fmt.Errorf("namespace tool requires name")
+	}
+	if namespace.Tools == nil {
+		namespace.Tools = namespace.Children
 	}
 	definitions := make([]Definition, 0, len(namespace.Tools))
 	for index, tool := range namespace.Tools {
@@ -437,6 +481,7 @@ func decodeOpenAIResponsesDefinition(raw json.RawMessage) (Definition, error) {
 		}, nil
 	}
 	return Definition{
+		Name:       strings.TrimSpace(kitutil.Interface2String(tool["name"])),
 		Kind:       kindFromNativeType(toolType),
 		Execution:  executionFromNativeType(toolType),
 		NativeType: toolType,
@@ -503,7 +548,25 @@ func decodeClaudeDefinition(raw json.RawMessage) (Definition, error) {
 			Raw:        cloneRaw(raw),
 		}, nil
 	}
-	if toolType == "" {
+	if toolType == "custom" {
+		nested, hasNested := tool["custom"].(map[string]any)
+		if !hasNested && tool["input_schema"] == nil {
+			return Definition{}, fmt.Errorf("custom tool requires custom or input_schema")
+		}
+		if hasNested {
+			for _, key := range []string{"description", "input_schema", "strict"} {
+				if _, present := tool[key]; !present {
+					if value, exists := nested[key]; exists {
+						tool[key] = value
+					}
+				}
+			}
+		}
+		if tool["input_schema"] == nil {
+			return Definition{}, fmt.Errorf("custom tool requires input_schema")
+		}
+	}
+	if toolType == "" || toolType == "custom" {
 		return Definition{
 			Kind:      KindFunction,
 			Execution: ExecutionClient,

@@ -90,8 +90,11 @@ func (b *ClaudeHostedStreamBridge) Convert(response *dto.ClaudeResponse, state *
 		return nil, false, nil
 	}
 	for _, stepState := range state.stepStates {
-		if streamState, ok := stepState.(*ChatToResponsesStreamState); ok {
+		switch streamState := stepState.(type) {
+		case *ChatToResponsesStreamState:
 			return b.bridge.Convert(response, streamState)
+		case *claudemessages.ClaudeToResponsesStreamState:
+			return b.bridge.Convert(response, streamState.Chat)
 		}
 	}
 	return nil, false, nil

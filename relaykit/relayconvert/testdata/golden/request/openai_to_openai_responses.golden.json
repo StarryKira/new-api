@@ -12,11 +12,8 @@
           "type": "input_image"
         }
       ],
-      "role": "user"
-    },
-    {
-      "content": "",
-      "role": "assistant"
+      "role": "user",
+      "type": "message"
     },
     {
       "arguments": "{\"city\":\"Paris\"}",
@@ -31,7 +28,8 @@
     },
     {
       "content": "Summarize.",
-      "role": "user"
+      "role": "user",
+      "type": "message"
     }
   ],
   "instructions": "You are a helpful assistant.",
@@ -53,6 +51,7 @@
         ],
         "type": "object"
       },
+      "strict": false,
       "type": "function"
     }
   ]

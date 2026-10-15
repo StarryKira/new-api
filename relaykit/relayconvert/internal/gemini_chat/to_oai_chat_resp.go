@@ -1,6 +1,7 @@
 package geminichat
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -67,6 +68,9 @@ func UsageFromGeminiMetadata(metadata *dto.GeminiUsageMetadata, fallbackPromptTo
 		}
 	}
 
+	if usage.TotalTokens == 0 {
+		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	}
 	if usage.TotalTokens > 0 && usage.CompletionTokens <= 0 {
 		usage.CompletionTokens = usage.TotalTokens - usage.PromptTokens
 	}
@@ -85,8 +89,8 @@ func ResponseGeminiChat2OpenAI(id string, created int64, response *dto.GeminiCha
 		Created: created,
 		Choices: make([]dto.OpenAITextResponseChoice, 0, len(response.Candidates)),
 	}
-	isToolCall := false
 	for _, candidate := range response.Candidates {
+		isToolCall := false
 		choice := dto.OpenAITextResponseChoice{
 			Index: int(candidate.Index),
 			Message: dto.Message{
@@ -99,6 +103,11 @@ func ResponseGeminiChat2OpenAI(id string, created int64, response *dto.GeminiCha
 			var content strings.Builder
 			var inlineGrow int
 			for _, part := range candidate.Content.Parts {
+				if part.FunctionCall == nil {
+					if signature := geminiThoughtSignature(part.ThoughtSignature); signature != "" {
+						choice.Message.ReasoningSignature = signature
+					}
+				}
 				if part.InlineData != nil {
 					inlineGrow += len(part.InlineData.MimeType) + len(part.InlineData.Data) + 32
 				}
@@ -106,14 +115,13 @@ func ResponseGeminiChat2OpenAI(id string, created int64, response *dto.GeminiCha
 			if inlineGrow > 0 {
 				content.Grow(inlineGrow)
 			}
-			appended := 0
 			writeSep := func() {
-				if appended > 0 {
+				if content.Len() > 0 && !strings.HasSuffix(content.String(), "\n") {
 					content.WriteByte('\n')
 				}
-				appended++
 			}
 			var toolCalls []dto.ToolCallResponse
+			var reasoning strings.Builder
 			for _, part := range candidate.Content.Parts {
 				if part.InlineData != nil {
 					if strings.HasPrefix(part.InlineData.MimeType, "image") {
@@ -136,8 +144,11 @@ func ResponseGeminiChat2OpenAI(id string, created int64, response *dto.GeminiCha
 					if call := geminiResponseToolCall(&part); call != nil {
 						toolCalls = append(toolCalls, *call)
 					}
-				} else if part.Thought {
-					choice.Message.ReasoningContent = &part.Text
+				} else if isGeminiThinkingPart(part) {
+					reasoning.WriteString(part.Text)
+					if signature := geminiThoughtSignature(part.ThoughtSignature); signature != "" {
+						choice.Message.ReasoningSignature = signature
+					}
 				} else {
 					if part.ExecutableCode != nil {
 						writeSep()
@@ -151,8 +162,7 @@ func ResponseGeminiChat2OpenAI(id string, created int64, response *dto.GeminiCha
 						content.WriteString("```output\n")
 						content.WriteString(part.CodeExecutionResult.Output)
 						content.WriteString("\n```")
-					} else if part.Text != "\n" {
-						writeSep()
+					} else {
 						content.WriteString(part.Text)
 					}
 				}
@@ -160,6 +170,10 @@ func ResponseGeminiChat2OpenAI(id string, created int64, response *dto.GeminiCha
 			if len(toolCalls) > 0 {
 				choice.Message.SetToolCalls(toolCalls)
 				isToolCall = true
+			}
+			if reasoning.Len() > 0 || choice.Message.ReasoningSignature != "" {
+				text := reasoning.String()
+				choice.Message.ReasoningContent = &text
 			}
 			choice.Message.SetStringContent(content.String())
 		}
@@ -198,8 +212,16 @@ func StreamResponseGeminiChat2OpenAI(geminiResponse *dto.GeminiChatResponse) (*d
 			Delta: dto.ChatCompletionsStreamResponseChoiceDelta{},
 		}
 		var content strings.Builder
+		var reasoning strings.Builder
+		isThought := false
 		var inlineGrow int
 		for _, part := range candidate.Content.Parts {
+			if part.FunctionCall == nil {
+				if signature := geminiThoughtSignature(part.ThoughtSignature); signature != "" {
+					choice.Delta.ReasoningSignature = signature
+					isThought = true
+				}
+			}
 			if part.InlineData != nil {
 				inlineGrow += len(part.InlineData.MimeType) + len(part.InlineData.Data) + 32
 			}
@@ -207,15 +229,12 @@ func StreamResponseGeminiChat2OpenAI(geminiResponse *dto.GeminiChatResponse) (*d
 		if inlineGrow > 0 {
 			content.Grow(inlineGrow)
 		}
-		appended := 0
 		writeSep := func() {
-			if appended > 0 {
+			if content.Len() > 0 && !strings.HasSuffix(content.String(), "\n") {
 				content.WriteByte('\n')
 			}
-			appended++
 		}
 		isTools := false
-		isThought := false
 		if candidate.FinishReason != nil {
 			switch *candidate.FinishReason {
 			case "STOP":
@@ -244,10 +263,12 @@ func StreamResponseGeminiChat2OpenAI(geminiResponse *dto.GeminiChatResponse) (*d
 					call.SetIndex(len(choice.Delta.ToolCalls))
 					choice.Delta.ToolCalls = append(choice.Delta.ToolCalls, *call)
 				}
-			} else if part.Thought {
+			} else if isGeminiThinkingPart(part) {
 				isThought = true
-				writeSep()
-				content.WriteString(part.Text)
+				reasoning.WriteString(part.Text)
+				if signature := geminiThoughtSignature(part.ThoughtSignature); signature != "" {
+					choice.Delta.ReasoningSignature = signature
+				}
 			} else {
 				if part.ExecutableCode != nil {
 					writeSep()
@@ -261,15 +282,15 @@ func StreamResponseGeminiChat2OpenAI(geminiResponse *dto.GeminiChatResponse) (*d
 					content.WriteString("```output\n")
 					content.WriteString(part.CodeExecutionResult.Output)
 					content.WriteString("\n```\n")
-				} else if part.Text != "\n" {
-					writeSep()
+				} else {
 					content.WriteString(part.Text)
 				}
 			}
 		}
 		if isThought {
-			choice.Delta.SetReasoningContent(content.String())
-		} else {
+			choice.Delta.SetReasoningContent(reasoning.String())
+		}
+		if content.Len() > 0 || !isThought {
 			choice.Delta.SetContentString(content.String())
 		}
 		if isTools {
@@ -292,6 +313,11 @@ func StreamResponseGeminiChat2OpenAI(geminiResponse *dto.GeminiChatResponse) (*d
 }
 
 type GeminiToChatStreamState struct {
+	cumulativeText      bool
+	textByCandidate     map[int64]string
+	thoughtByCandidate  map[int64]string
+	roleSentByCandidate map[int64]bool
+
 	id            string
 	created       int64
 	sawToolCall   bool
@@ -307,6 +333,7 @@ type GeminiToChatStreamState struct {
 }
 
 type geminiPartialToolCall struct {
+	signature json.RawMessage
 	id        string
 	name      string
 	arguments map[string]interface{}
@@ -329,6 +356,7 @@ func NewGeminiToChatStreamState(id string, created int64) *GeminiToChatStreamSta
 		created = kitutil.GetTimestamp()
 	}
 	return &GeminiToChatStreamState{
+		textByCandidate: make(map[int64]string), thoughtByCandidate: make(map[int64]string), roleSentByCandidate: make(map[int64]bool),
 		id:                       id,
 		created:                  created,
 		nextToolIndexByCandidate: make(map[int64]int),
@@ -358,10 +386,28 @@ func (s *GeminiToChatStreamState) ConvertChunk(geminiResponse *dto.GeminiChatRes
 	if s.partialToolByCandidate == nil {
 		s.partialToolByCandidate = make(map[int64]*geminiPartialToolCall)
 	}
+	if parts := splitGeminiMixedStreamParts(geminiResponse); len(parts) > 1 {
+		var responses []*dto.ChatCompletionsStreamResponse
+		for index, part := range parts {
+			var partUsage *dto.Usage
+			if index == len(parts)-1 {
+				partUsage = usage
+			}
+			chunks, err := s.ConvertChunk(part, model, partUsage)
+			if err != nil {
+				return nil, err
+			}
+			responses = append(responses, chunks...)
+		}
+		return responses, nil
+	}
 	var err error
 	geminiResponse, err = s.preparePartialFunctionCalls(geminiResponse)
 	if err != nil {
 		return nil, err
+	}
+	if s.cumulativeText {
+		geminiResponse = s.normalizeCumulativeText(geminiResponse)
 	}
 	hasNonStopFinish := false
 	for _, candidate := range geminiResponse.Candidates {
@@ -384,6 +430,10 @@ func (s *GeminiToChatStreamState) ConvertChunk(geminiResponse *dto.GeminiChatRes
 		}
 		candidate := &geminiResponse.Candidates[index]
 		choice := &response.Choices[index]
+		if !s.roleSentByCandidate[candidate.Index] {
+			choice.Delta.Role = "assistant"
+			s.roleSentByCandidate[candidate.Index] = true
+		}
 		for toolIndex := range choice.Delta.ToolCalls {
 			callID := strings.TrimSpace(choice.Delta.ToolCalls[toolIndex].ID)
 			indexesByID := s.toolIndexByCandidateID[candidate.Index]
@@ -482,13 +532,20 @@ func (s *GeminiToChatStreamState) preparePartialFunctionCalls(response *dto.Gemi
 				parts = append(parts, part)
 				continue
 			}
+			signature := part.ThoughtSignature
+			if partial := s.partialToolByCandidate[candidate.Index]; partial != nil && len(signature) == 0 {
+				signature = partial.signature
+			}
 			completed, ready, err := s.appendPartialFunctionCall(candidate.Index, call)
 			if err != nil {
 				return nil, fmt.Errorf("reconstruct Gemini streamed function arguments: %w", err)
 			}
 			if ready {
 				part.FunctionCall = completed
+				part.ThoughtSignature = signature
 				parts = append(parts, part)
+			} else if partial := s.partialToolByCandidate[candidate.Index]; partial != nil {
+				partial.signature = append(json.RawMessage(nil), signature...)
 			}
 		}
 		candidate.Content.Parts = parts
@@ -729,11 +786,114 @@ func geminiResponseToolCall(item *dto.GeminiPart) *dto.ToolCallResponse {
 		callID = fmt.Sprintf("call_%s", kitutil.GetUUID())
 	}
 	return &dto.ToolCallResponse{
-		ID:   callID,
-		Type: "function",
+		ExtraContent: dto.GoogleThoughtSignature(item.ThoughtSignature),
+		ID:           callID,
+		Type:         "function",
 		Function: dto.FunctionResponse{
 			Arguments: string(argsBytes),
 			Name:      item.FunctionCall.FunctionName,
 		},
 	}
+}
+
+func geminiThoughtSignature(raw json.RawMessage) string {
+	var signature string
+	_ = kitutil.Unmarshal(raw, &signature)
+	return signature
+}
+
+func isGeminiThinkingPart(part dto.GeminiPart) bool {
+	return part.Thought || (len(part.ThoughtSignature) > 0 && part.Text == "" && part.FunctionCall == nil && part.InlineData == nil)
+}
+
+// The Chat pivot has separate reasoning, text, and tool fields, so combining
+// heterogeneous Gemini parts in one chunk loses their order. Emit each part
+// in source order, with usage and finish metadata on the last part only.
+func splitGeminiMixedStreamParts(response *dto.GeminiChatResponse) []*dto.GeminiChatResponse {
+	if len(response.Candidates) != 1 {
+		return nil
+	}
+	candidate := response.Candidates[0]
+	// A signature may accompany ordinary text or media. Carry it as a separate
+	// signature-only reasoning delta so consumers can retain the replay token
+	// without changing visible text into thinking text.
+	expanded := make([]dto.GeminiPart, 0, len(candidate.Content.Parts))
+	for _, part := range candidate.Content.Parts {
+		signature := part.ThoughtSignature
+		hasOrdinarySignature := len(signature) > 0 && !part.Thought && part.FunctionCall == nil && (part.Text != "" || part.InlineData != nil || part.FileData != nil)
+		if hasOrdinarySignature {
+			part.ThoughtSignature = nil
+		}
+		expanded = append(expanded, part)
+		if hasOrdinarySignature {
+			expanded = append(expanded, dto.GeminiPart{ThoughtSignature: signature})
+		}
+	}
+	candidate.Content.Parts = expanded
+	if len(candidate.Content.Parts) < 2 {
+		return nil
+	}
+	kind := func(part dto.GeminiPart) int {
+		if part.FunctionCall != nil {
+			return 2
+		}
+		if isGeminiThinkingPart(part) {
+			return 1
+		}
+		return 0
+	}
+	mixed := false
+	for _, part := range candidate.Content.Parts[1:] {
+		if kind(part) != kind(candidate.Content.Parts[0]) {
+			mixed = true
+			break
+		}
+	}
+	if !mixed {
+		return nil
+	}
+	out := make([]*dto.GeminiChatResponse, 0, len(candidate.Content.Parts))
+	for index, part := range candidate.Content.Parts {
+		split := *response
+		c := candidate
+		c.Content.Parts = []dto.GeminiPart{part}
+		if index != len(candidate.Content.Parts)-1 {
+			c.FinishReason = nil
+			c.GroundingMetadata = nil
+			split.UsageMetadata = dto.GeminiUsageMetadata{}
+			split.HasUsageMetadata = false
+		}
+		split.Candidates = []dto.GeminiChatCandidate{c}
+		out = append(out, &split)
+	}
+	return out
+}
+
+func (s *GeminiToChatStreamState) SetCumulativeText(enabled bool) { s.cumulativeText = enabled }
+
+func (s *GeminiToChatStreamState) normalizeCumulativeText(response *dto.GeminiChatResponse) *dto.GeminiChatResponse {
+	prepared := *response
+	prepared.Candidates = append([]dto.GeminiChatCandidate(nil), response.Candidates...)
+	for i := range prepared.Candidates {
+		candidate := &prepared.Candidates[i]
+		candidate.Content.Parts = append([]dto.GeminiPart(nil), candidate.Content.Parts...)
+		for j := range candidate.Content.Parts {
+			part := &candidate.Content.Parts[j]
+			if part.Text == "" {
+				continue
+			}
+			seen := s.textByCandidate
+			if part.Thought {
+				seen = s.thoughtByCandidate
+			}
+			previous := seen[candidate.Index]
+			if strings.HasPrefix(part.Text, previous) {
+				seen[candidate.Index] = part.Text
+				part.Text = strings.TrimPrefix(part.Text, previous)
+			} else {
+				seen[candidate.Index] = previous + part.Text
+			}
+		}
+	}
+	return &prepared
 }

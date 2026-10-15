@@ -13,6 +13,10 @@ import (
 )
 
 func ResponsesResponseToClaudeMessagesResponse(resp *dto.OpenAIResponsesResponse) (*dto.ClaudeResponse, *dto.Usage, error) {
+	return ResponsesResponseToClaudeMessagesResponseWithPolicy(resp, false)
+}
+
+func ResponsesResponseToClaudeMessagesResponseWithPolicy(resp *dto.OpenAIResponsesResponse, readEmptyPages bool) (*dto.ClaudeResponse, *dto.Usage, error) {
 	if resp == nil {
 		return nil, nil, errors.New("response is nil")
 	}
@@ -33,10 +37,11 @@ func ResponsesResponseToClaudeMessagesResponse(resp *dto.OpenAIResponsesResponse
 		}
 		switch output.Type {
 		case responsesOutputTypeReasoning:
-			if thinking := reasoningOutputText(&output); thinking != "" {
+			if block, ok := sharedclaude.DecodeThinkingBlock(output.EncryptedContent); ok {
+				claudeResponse.Content = append(claudeResponse.Content, block)
+			} else if thinking := reasoningOutputText(&output); thinking != "" || output.EncryptedContent != "" {
 				claudeResponse.Content = append(claudeResponse.Content, dto.ClaudeMediaMessage{
-					Type:     "thinking",
-					Thinking: kitutil.GetPointer(thinking),
+					Type: "thinking", Thinking: kitutil.GetPointer(thinking), Signature: output.EncryptedContent,
 				})
 			}
 		case responsesOutputTypeMessage:
@@ -60,7 +65,7 @@ func ResponsesResponseToClaudeMessagesResponse(resp *dto.OpenAIResponsesResponse
 				Type:  "tool_use",
 				Id:    callID,
 				Name:  output.Name,
-				Input: responsesArgumentsToClaudeInput(output.ArgumentsString()),
+				Input: responsesArgumentsToClaudeInput(claudeToolArguments(output.Name, output.ArgumentsString(), readEmptyPages)),
 			})
 		}
 	}
@@ -153,4 +158,11 @@ func responsesAnnotationIndex(value any) (int, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func claudeToolArguments(name, raw string, enabled bool) string {
+	if enabled {
+		return sharedclaude.ClaudeCodeReadInput(name, raw)
+	}
+	return raw
 }

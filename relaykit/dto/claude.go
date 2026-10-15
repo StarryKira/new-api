@@ -50,6 +50,17 @@ type ClaudeMediaMessage struct {
 	ToolUseId string `json:"tool_use_id,omitempty"`
 }
 
+// MarshalJSON preserves the required empty thinking/signature keys used by
+// Anthropic clients, including content_block_start before a signature arrives.
+func (c ClaudeMediaMessage) MarshalJSON() ([]byte, error) {
+	type plain ClaudeMediaMessage
+	raw, err := kitutil.Marshal(plain(c))
+	if err != nil {
+		return nil, err
+	}
+	return NormalizeClaudeContentBlockJSON(raw)
+}
+
 func (c *ClaudeMediaMessage) SetText(s string) {
 	c.Text = &s
 }
@@ -640,6 +651,8 @@ func (c *ClaudeResponse) GetClaudeError() *types.ClaudeError {
 }
 
 type ClaudeUsage struct {
+	Speed                    string `json:"speed,omitempty"`
+	inputTokensAuthoritative bool
 	InputTokens              int                       `json:"input_tokens"`
 	CacheCreationInputTokens int                       `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int                       `json:"cache_read_input_tokens"`
@@ -686,4 +699,41 @@ type ClaudeServerToolUse struct {
 	WebFetchRequests      int `json:"web_fetch_requests,omitempty"`
 	CodeExecutionRequests int `json:"code_execution_requests,omitempty"`
 	ToolSearchRequests    int `json:"tool_search_requests,omitempty"`
+}
+
+// UnmarshalJSON accepts usage aliases emitted by Anthropic-compatible providers.
+// Canonical Claude counters are independent buckets; only an explicit prompt
+// total or miss bucket permits subtraction from the input token count.
+func (u *ClaudeUsage) UnmarshalJSON(data []byte) error {
+	type plain ClaudeUsage
+	var value struct {
+		plain
+		PromptTokens          int                `json:"prompt_tokens"`
+		PromptCacheHitTokens  *int               `json:"prompt_cache_hit_tokens"`
+		PromptCacheMissTokens *int               `json:"prompt_cache_miss_tokens"`
+		CachedTokens          int                `json:"cached_tokens"`
+		PromptTokensDetails   *InputTokenDetails `json:"prompt_tokens_details"`
+	}
+	if err := kitutil.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	*u = ClaudeUsage(value.plain)
+	if u.CacheReadInputTokens == 0 {
+		u.CacheReadInputTokens = value.CachedTokens
+	}
+	if u.CacheReadInputTokens == 0 && value.PromptTokensDetails != nil {
+		u.CacheReadInputTokens = value.PromptTokensDetails.CachedTokens
+	}
+	if u.CacheReadInputTokens == 0 && value.PromptCacheHitTokens != nil {
+		u.CacheReadInputTokens = max(*value.PromptCacheHitTokens, 0)
+	}
+	u.inputTokensAuthoritative = value.PromptTokens > 0 || value.PromptCacheHitTokens != nil || value.PromptCacheMissTokens != nil
+	if u.inputTokensAuthoritative {
+		if value.PromptCacheMissTokens != nil {
+			u.InputTokens = max(*value.PromptCacheMissTokens, 0)
+		} else {
+			u.InputTokens = max(value.PromptTokens-u.CacheReadInputTokens-u.GetCacheCreationTotalTokens(), 0)
+		}
+	}
+	return nil
 }

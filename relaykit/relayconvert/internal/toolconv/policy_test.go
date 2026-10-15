@@ -241,41 +241,13 @@ func TestResponsesCustomToolReachesEachTargetAsStringInputFunction(t *testing.T)
 	}
 }
 
-func TestResponsesCustomToolNameConflictIsDropped(t *testing.T) {
+func TestResponsesCustomToolNameConflictIsRejected(t *testing.T) {
 	t.Parallel()
-
-	// The custom exec loses to the function exec, so a choice naming it has no
-	// sent tool to point at and must stay unconverted.
+	// A cross-kind collision cannot be restored safely after function lowering.
 	request := codexResponsesToolsRequest(t, map[string]any{"type": "custom", "name": "exec"},
 		map[string]any{"type": "function", "name": "exec", "parameters": map[string]any{"type": "object"}},
 		map[string]any{"type": "custom", "name": "apply_patch"},
-		map[string]any{"type": "custom", "name": "apply_patch", "description": "duplicate"},
 	)
-	_, set, err := ExtractRequest(types.RelayFormatOpenAIResponses, request)
-	require.NoError(t, err)
-	assert.Equal(t, map[string]struct{}{"apply_patch": {}}, ResponsesCustomToolNames(set))
-
-	for _, target := range responsesCustomToolTargets {
-		t.Run(string(target.format), func(t *testing.T) {
-			out, diagnostics, err := AttachRequest(target.format, target.request(), set, &convmeta.Options{})
-			require.NoError(t, err)
-			functions, choice := attachedFunctions(t, out)
-			require.Len(t, functions, 3)
-			names := make([]string, 0, len(functions))
-			for _, function := range functions {
-				names = append(names, function["name"].(string))
-			}
-			assert.Equal(t, []string{"wait", "exec", "apply_patch"}, names)
-			// Only the custom definitions carry a description, so the kept exec
-			// is the function one.
-			assert.NotContains(t, functions[1], "description")
-			assert.NotContains(t, functions[2]["description"], "duplicate")
-			assert.Nil(t, choice)
-			assert.True(t, hasDiagnosticCode(diagnostics, "custom_tool_name_conflict"))
-			assert.True(t, hasDiagnosticCode(diagnostics, "unsupported_tool_choice"))
-
-			_, _, err = AttachRequest(target.format, target.request(), set, &convmeta.Options{ToolLossPolicy: types.ConversionLossPolicySafe})
-			require.Error(t, err)
-		})
-	}
+	_, _, err := ExtractRequest(types.RelayFormatOpenAIResponses, request)
+	require.ErrorContains(t, err, "cannot disambiguate")
 }

@@ -422,9 +422,10 @@ func TestResponsesRequestToChatCompletionsRequestToolOutputContentParts(t *testi
 			jsonContent: true,
 		},
 		{
-			name:        "unknown part keeps whole array",
+			name:        "unknown part survives image extraction",
 			output:      []any{imagePart, map[string]any{"type": "refusal", "refusal": "no"}},
-			wantContent: `[{"type":"input_image","image_url":"` + dataURL + `"},{"type":"refusal","refusal":"no"}]`,
+			wantContent: `[{"type":"input_text","text":"[Tool output media moved to the following user message]"},{"type":"refusal","refusal":"no"}]`,
+			wantMedia:   []string{dto.ContentTypeImageURL},
 			jsonContent: true,
 		},
 	}

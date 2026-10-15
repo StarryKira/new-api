@@ -52,13 +52,14 @@ func ChatCompletionsResponseToResponsesResponseWithTools(resp *dto.OpenAITextRes
 
 	usage := UsageFromChatUsage(&resp.Usage)
 	out := &dto.OpenAIResponsesResponse{
-		ID:        id,
-		Object:    "response",
-		CreatedAt: dto.IntValue(chatCreatedAt(resp.Created)),
-		Status:    []byte(`"completed"`),
-		Model:     resp.Model,
-		Output:    make([]dto.ResponsesOutput, 0),
-		Usage:     usage,
+		ServiceTier: resp.ServiceTier,
+		ID:          id,
+		Object:      "response",
+		CreatedAt:   dto.IntValue(chatCreatedAt(resp.Created)),
+		Status:      []byte(`"completed"`),
+		Model:       resp.Model,
+		Output:      make([]dto.ResponsesOutput, 0),
+		Usage:       usage,
 	}
 
 	if len(resp.Choices) == 0 {
@@ -71,11 +72,12 @@ func ChatCompletionsResponseToResponsesResponseWithTools(resp *dto.OpenAITextRes
 		out.IncompleteDetails = details
 	}
 
-	if reasoning := choice.Message.GetReasoningContent(); reasoning != "" {
+	if reasoning := choice.Message.GetReasoningContent(); reasoning != "" || choice.Message.ReasoningSignature != "" {
 		out.Output = append(out.Output, dto.ResponsesOutput{
-			Type:   responsesOutputTypeReasoning,
-			ID:     fmt.Sprintf("%s_reasoning_0", id),
-			Status: responseOutputStatus(out),
+			EncryptedContent: choice.Message.ReasoningSignature,
+			Type:             responsesOutputTypeReasoning,
+			ID:               fmt.Sprintf("%s_reasoning_0", id),
+			Status:           responseOutputStatus(out),
 			Summary: []dto.ResponsesReasoningSummaryPart{
 				{
 					Type: "summary_text",
@@ -106,6 +108,9 @@ func ChatCompletionsResponseToResponsesResponseWithTools(resp *dto.OpenAITextRes
 
 	for i, toolCall := range choice.Message.ParseToolCalls() {
 		if (toolCall.Type == "" || toolCall.Type == "function") && strings.TrimSpace(toolCall.Function.Name) == "" {
+			continue
+		}
+		if choice.FinishReason == chatFinishReasonLength && !tools.IsCustomTool(toolCall.Function.Name) && strings.TrimSpace(toolCall.Function.Arguments) != "" && !kitutil.Valid([]byte(toolCall.Function.Arguments)) {
 			continue
 		}
 		toolOutput, err := chatToolCallToResponsesOutput(toolCall, id, i, responseOutputStatus(out), tools)
@@ -196,6 +201,14 @@ func UsageFromChatUsage(src *dto.Usage) *dto.Usage {
 		src.CompletionTokenDetails.ImageTokens != 0 {
 		usage.CompletionTokenDetails = src.CompletionTokenDetails
 	}
+	if src.LegacyCacheCreationInputTokens > 0 {
+		if usage.InputTokensDetails == nil {
+			usage.InputTokensDetails = &dto.InputTokenDetails{}
+		}
+		if usage.InputTokensDetails.CacheCreationTokensTotal() == 0 {
+			usage.InputTokensDetails.CachedCreationTokens = src.LegacyCacheCreationInputTokens
+		}
+	}
 	usage.ClaudeCacheCreation5mTokens = src.ClaudeCacheCreation5mTokens
 	usage.ClaudeCacheCreation1hTokens = src.ClaudeCacheCreation1hTokens
 	return usage
@@ -223,6 +236,9 @@ func chatToolCallToResponsesOutput(toolCall dto.ToolCallRequest, responseID stri
 		callID = fmt.Sprintf("%s_call_%d", responseID, index)
 	}
 	if toolCall.Type == "" || toolCall.Type == "function" {
+		if tools != nil && tools.ToolSearch && toolCall.Function.Name == convmeta.ToolSearchFunctionName {
+			return dto.ResponsesOutput{Type: "tool_search_call", ID: callID, CallId: callID, Status: status, Execution: "client", Arguments: chatToolSearchArguments(toolCall.Function.Arguments)}, nil
+		}
 		namespace, name := tools.ResponsesToolName(toolCall.Function.Name)
 		if tools.IsCustomTool(toolCall.Function.Name) {
 			return dto.ResponsesOutput{
@@ -287,13 +303,21 @@ func chatArgumentsRawMessage(arguments string) []byte {
 func chatCreatedAt(created any) int {
 	switch v := created.(type) {
 	case int:
-		return v
+		if v > 0 {
+			return v
+		}
 	case int64:
-		return int(v)
+		if v > 0 {
+			return int(v)
+		}
 	case float64:
-		return int(v)
+		if v > 0 {
+			return int(v)
+		}
 	case float32:
-		return int(v)
+		if v > 0 {
+			return int(v)
+		}
 	case string:
 		if parsed := kitutil.String2Int(v); parsed != 0 {
 			return parsed
@@ -316,4 +340,16 @@ func intPtr(v int) *int {
 
 func stringPtr(v string) *string {
 	return &v
+}
+
+// Preserve malformed provider arguments as a JSON string so downstream clients
+// can report a tool error; never replace the supplied arguments with {}.
+func chatToolSearchArguments(arguments string) []byte {
+	if strings.TrimSpace(arguments) == "" {
+		return []byte(`{}`)
+	}
+	if kitutil.Valid([]byte(arguments)) {
+		return []byte(arguments)
+	}
+	return chatArgumentsRawMessage(arguments)
 }

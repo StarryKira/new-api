@@ -15,7 +15,7 @@ RelayKit 是一个 Go 模块，在 OpenAI Chat Completions、OpenAI Responses、
 | Claude Messages | `fair` | `fair` | | `discouraged` |
 | Gemini | `fair` | `fair` | `discouraged` | |
 
-`good` 表示两种协议结构接近，字段基本一一对应。`fair` 表示主要内容都能转，协议独有的字段以诊断报告。其中 Gemini 转 Responses 的请求和响应、Claude 转 Responses 的响应、Responses 转 Gemini 的响应经 OpenAI Chat 中转。`discouraged` 表示 Claude 和 Gemini 之间请求和响应都经 OpenAI Chat 中转两跳，丢字段的机会更多。实际走的路径在转换结果的 `Steps` 里，等级在 `Quality` 里。
+`good` 表示两种协议结构接近，字段基本一一对应。`fair` 表示主要内容都能转，协议独有的字段以诊断报告。其中 Gemini 转 Responses 的请求和响应、Responses 转 Gemini 的响应经 OpenAI Chat 中转。Claude → Gemini 请求和 Gemini → Claude 响应使用直接转换，保留内容顺序和思考签名；其余 `discouraged` 路径仍经 OpenAI Chat 中转，协议特有字段可能产生损耗。实际走的路径在转换结果的 `Steps` 里，等级在 `Quality` 里。
 
 ## 功能
 
@@ -26,6 +26,10 @@ RelayKit 是一个 Go 模块，在 OpenAI Chat Completions、OpenAI Responses、
 ### 工具调用
 
 function tool 的定义、调用和结果在四种协议之间互转。Responses 的 custom tool 和带 namespace 的工具发往 Chat、Claude、Gemini 上游时改成普通 function tool，编码方式记在 `convmeta.ResponsesToolState` 里，响应转换时按这份记录还原成 Responses 的形状。托管 web search 按目标协议重新编码：Chat 用 `web_search_options`，Responses、Claude 和 Gemini 各用自己协议的 web search 工具定义，宿主可以通过 `Options.WebSearch` 为某个上游改写编码。其他托管工具在目标协议里表达不了的部分，转换照常完成，缺失写进诊断。
+
+### 签名思考回放
+
+Claude 到 Responses 使用原生响应转换，保留思考、文本和工具块的顺序。已签名的 thinking 和 redacted_thinking 以 `anthropic-thinking-v1:` 信封存入 `encrypted_content`，回转 Claude 时还原原始块。其他提供商的 Responses `encrypted_content` 映射到 Claude `thinking.signature`，支持只有签名、没有摘要的回放。
 
 ### 推理设置
 
@@ -136,6 +140,12 @@ if err != nil {
 
 openAIResponse := result.Value.(*dto.OpenAITextResponse)
 usage := result.Usage
+
+wire, err := relayconvert.MarshalResponse(*result)
+if err != nil {
+	return err
+}
+emitJSON(wire)
 ```
 
 支持的响应 DTO：
@@ -160,6 +170,7 @@ state, err := relayconvert.NewResponseStreamState(
 		Model:              "gpt-4.1",
 		IncludeUsage:       true,
 		EmitSequenceNumber: true,
+		RequireTerminalEvent: true,
 	},
 )
 if err != nil {
@@ -172,7 +183,9 @@ for _, chunk := range upstreamChunks {
 		return err
 	}
 	for _, result := range results {
-		emit(result.Value)
+		wire, err := relayconvert.MarshalResponse(result)
+		if err != nil { return err }
+		emitJSON(wire)
 	}
 }
 
@@ -181,14 +194,22 @@ if err != nil {
 	return err
 }
 for _, result := range finalResults {
-	emit(result.Value)
+	wire, err := relayconvert.MarshalResponse(result)
+	if err != nil { return err }
+	emitJSON(wire)
 }
 
 usage := state.Usage()
 diagnostics := state.Diagnostics()
 ```
 
+设置 `RequireTerminalEvent` 后，只有收到源协议终态或宿主在实际收到 `[DONE]` 时调用 `state.MarkTransportComplete()`，finalizer 才会成功。普通 EOF 返回 `ErrIncompleteResponseStream`，不会补发成功终态；已记录的用量仍然可读。该选项默认关闭以兼容现有调用方。
+
 SSE 的读取和写入由宿主完成：把每个上游事件解析成对应的 DTO 传进来，再把转换结果编码后发给下游。`FinalizeStreamResponse` 每条流都要调用，部分转换器在这一步才补发终止事件和最终 usage。
+
+下游 JSON 使用 `MarshalResponse` 编码：它展开流式事件的内部 envelope，保留严格 SDK 要求的零索引和空值，并把 `BillingUsage` 等内部计费元数据留在返回结果中。不要把内部元数据作为协议字段发给客户端。上游读取失败或取消时，不要调用成功 finalizer；已采集的 usage 仍可供宿主结算使用。
+
+`NewClaudeBufferedAccumulator`、`NewGeminiBufferedAccumulator` 和 `NewResponsesBufferedAccumulator` 负责非流式客户端所需的流聚合，包含起始工具参数、签名增量和终态正文恢复。原生 Responses 方言工具、namespace、工具搜索和媒体处理位于 `relayconvert/responsescompat`；旧 Chat 形状的 Responses 入口归一化位于 `relayconvert/ingresscompat`；供应商方言适配位于 `relayconvert/providercompat`。这些入口保留未知 JSON 字段，宿主只选择适用的策略。
 
 ## 转换上下文
 

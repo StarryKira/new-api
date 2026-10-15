@@ -8,12 +8,14 @@ import (
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
+	sharedclaude "github.com/QuantumNous/new-api/relaykit/relayconvert/internal/shared/claude"
 	sharedgemini "github.com/QuantumNous/new-api/relaykit/relayconvert/internal/shared/gemini"
 	kitutil "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
 	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
 func AttachRequest(format types.RelayFormat, request any, set Set, options *convmeta.Options) (any, []types.ConversionDiagnostic, error) {
+	set = lowerResponsesToolSearch(set, format)
 	if set.Empty() {
 		return request, nil, nil
 	}
@@ -59,6 +61,10 @@ func attachOpenAIChatRequest(request any, set Set, options *convmeta.Options) (a
 	// instead of web_search_options.
 	chatWebSearchEncoded := false
 	for index, definition := range set.Definitions {
+		if preserveOpenAITool(set, options, definition.NativeType) && len(definition.Raw) > 0 {
+			target.Tools = append(target.Tools, dto.ToolCallRequest{Type: definition.NativeType, Native: cloneRaw(definition.Raw)})
+			continue
+		}
 		switch definition.Kind {
 		case KindFunction:
 			if definition.Function == nil {
@@ -142,7 +148,24 @@ func attachOpenAIChatRequest(request any, set Set, options *convmeta.Options) (a
 		return target, append(diagnostics, toolChoiceWithoutToolsDiagnostics(set)...), nil
 	}
 	normalizedChoice, allowedChoiceDiagnostics := narrowAllowedFunctionChoice(responsesCustomToolChoice(set.Choice, customTools), types.RelayFormatOpenAI)
+	if normalizedChoice != nil && normalizedChoice.Mode == ChoiceNamed && normalizedChoice.Kind == KindFunction {
+		declared := false
+		for _, tool := range target.Tools {
+			if tool.Type == "function" && tool.Function.Name == normalizedChoice.Name {
+				declared = true
+				break
+			}
+		}
+		if !declared {
+			diagnostics = append(diagnostics, semanticLoss("tool_choice", "undeclared_tool_choice", "the selected function was not sent to the target, so its tool_choice was omitted"))
+			normalizedChoice = nil
+		}
+	}
 	choice, choiceDiagnostics := encodeOpenAIChatChoice(normalizedChoice)
+	if raw, preserve := openAIDialectChoice(set, options); preserve {
+		choice = raw
+		choiceDiagnostics = nil
+	}
 	target.ToolChoice = choice
 	target.ParallelTooCalls = set.ParallelAllowed
 	diagnostics = append(diagnostics, allowedChoiceDiagnostics...)
@@ -415,6 +438,10 @@ func attachOpenAIResponsesRequest(request any, set Set, options *convmeta.Option
 	tools := make([]any, 0, len(set.Definitions))
 	var diagnostics []types.ConversionDiagnostic
 	for index, definition := range set.Definitions {
+		if preserveOpenAITool(set, options, definition.NativeType) && len(definition.Raw) > 0 {
+			tools = append(tools, json.RawMessage(cloneRaw(definition.Raw)))
+			continue
+		}
 		switch definition.Kind {
 		case KindFunction:
 			if definition.Function == nil {
@@ -422,6 +449,17 @@ func attachOpenAIResponsesRequest(request any, set Set, options *convmeta.Option
 			}
 			parameters, schemaDiagnostics := jsonSchemaParameters(index, definition.Function)
 			diagnostics = append(diagnostics, schemaDiagnostics...)
+			if parameters == nil {
+				parameters = map[string]any{"type": "object", "properties": map[string]any{}}
+			}
+			if schema, ok := parameters.(map[string]any); ok && schema["type"] == "object" && schema["properties"] == nil {
+				copy := make(map[string]any, len(schema)+1)
+				for key, value := range schema {
+					copy[key] = value
+				}
+				copy["properties"] = map[string]any{}
+				parameters = copy
+			}
 			tool := map[string]any{
 				"type":        "function",
 				"name":        definition.Function.Name,
@@ -430,6 +468,9 @@ func attachOpenAIResponsesRequest(request any, set Set, options *convmeta.Option
 			}
 			if definition.Function.Strict != nil {
 				tool["strict"] = *definition.Function.Strict
+			} else if set.Source != types.RelayFormatOpenAIResponses {
+				// Responses defaults to strict schemas; other protocols do not.
+				tool["strict"] = false
 			}
 			deleteEmptyStrings(tool)
 			tools = append(tools, tool)
@@ -508,6 +549,11 @@ func attachOpenAIResponsesRequest(request any, set Set, options *convmeta.Option
 	target.Tools = encoded
 	normalizedChoice, allowedChoiceDiagnostics := narrowAllowedFunctionChoice(set.Choice, types.RelayFormatOpenAIResponses)
 	choice, choiceDiagnostics, err := encodeOpenAIResponsesChoice(normalizedChoice, set.Source)
+	if raw, preserve := openAIDialectChoice(set, options); preserve {
+		choice = raw
+		choiceDiagnostics = nil
+		err = nil
+	}
 	if err != nil {
 		return nil, diagnostics, err
 	}
@@ -539,6 +585,13 @@ func attachClaudeRequest(request any, set Set, options *convmeta.Options) (any, 
 			if err != nil {
 				return nil, diagnostics, fmt.Errorf("tools[%d].input_schema: %w", index, err)
 			}
+			for _, keyword := range []string{"oneOf", "anyOf", "allOf"} {
+				if _, ok := inputSchema[keyword]; ok {
+					diagnostics = append(diagnostics, semanticLoss(fmt.Sprintf("tools[%d].input_schema", index), "claude_root_union_flattened", "Claude requires an object root schema; object branches are merged"))
+					break
+				}
+			}
+			inputSchema = sharedclaude.FunctionParametersToInputSchema(inputSchema)
 			tools = append(tools, &dto.Tool{
 				Name:        definition.Function.Name,
 				Description: definition.Function.Description,
@@ -638,12 +691,14 @@ func attachClaudeRequest(request any, set Set, options *convmeta.Options) (any, 
 	diagnostics = append(diagnostics, allowedChoiceDiagnostics...)
 	forced := normalizedChoice != nil && (normalizedChoice.Mode == ChoiceRequired || normalizedChoice.Mode == ChoiceNamed)
 	manualThinking := target.Thinking != nil && target.Thinking.Type == "enabled"
-	if forced && manualThinking && set.Source != types.RelayFormatClaude {
+	model := strings.ToLower(target.Model)
+	rejectsForcedTools := strings.HasPrefix(model, "claude-opus-5-5") || strings.HasPrefix(model, "claude-sonnet-5-5")
+	if forced && (manualThinking || rejectsForcedTools) && set.Source != types.RelayFormatClaude {
 		downgraded := *normalizedChoice
 		downgraded.Mode = ChoiceAuto
 		normalizedChoice = &downgraded
 		diagnostics = append(diagnostics, semanticLoss("tool_choice", "forced_tool_choice_downgraded",
-			"Claude rejects forced tool use while manual extended thinking is enabled; tool_choice was sent as auto, so the model may answer without calling a tool"))
+			"Claude rejects forced tool use with this model or thinking mode; tool_choice was sent as auto, so the model may answer without calling a tool"))
 	}
 	choice, choiceDiagnostics := encodeClaudeChoice(normalizedChoice, set.ParallelAllowed, set.Source)
 	target.ToolChoice = choice
@@ -681,6 +736,7 @@ func attachGeminiRequest(request any, set Set, options *convmeta.Options) (any, 
 		tools     []any
 	)
 	jsonSchema := options != nil && options.Gemini.SupportsJSONSchemaModel(set.Model)
+	stringifyEnums := options != nil && options.Gemini.StringifyScalarEnums
 	customTools, diagnostics := responsesCustomTools(set)
 	for index, definition := range set.Definitions {
 		switch definition.Kind {
@@ -695,7 +751,7 @@ func attachGeminiRequest(request any, set Set, options *convmeta.Options) (any, 
 					return nil, diagnostics, fmt.Errorf("tools[%d].parameters: %w", index, err)
 				}
 				var misfits []string
-				parametersField, parameters, misfits = sharedgemini.FunctionParameters(cloned, jsonSchema)
+				parametersField, parameters, misfits = sharedgemini.FunctionParameters(cloned, jsonSchema, stringifyEnums)
 				if len(misfits) > 0 {
 					diagnostics = append(diagnostics, presentationLoss(fmt.Sprintf("tools[%d].parameters", index), "gemini_schema_keyword_dropped",
 						fmt.Sprintf("Gemini function parameters cannot carry %s", strings.Join(misfits, ", "))))
@@ -734,7 +790,7 @@ func attachGeminiRequest(request any, set Set, options *convmeta.Options) (any, 
 				diagnostics = append(diagnostics, geminiWebSearchDiagnostics(index, definition.WebSearch)...)
 			}
 		case KindCodeExecution:
-			if set.Source == types.RelayFormatGemini || definition.NativeType == "codeExecution" {
+			if set.Source == types.RelayFormatGemini || definition.NativeType == "codeExecution" || definition.NativeType == "code_execution" {
 				tools = append(tools, map[string]any{"codeExecution": map[string]any{}})
 				continue
 			}
@@ -759,7 +815,7 @@ func attachGeminiRequest(request any, set Set, options *convmeta.Options) (any, 
 					functions = append(functions, map[string]any{
 						"name":        tool.name,
 						"description": tool.description,
-						"parameters":  sharedgemini.CleanFunctionParameters(tool.inputSchema()),
+						"parameters":  sharedgemini.CleanFunctionParameters(tool.inputSchema(), stringifyEnums),
 					})
 				}
 				continue

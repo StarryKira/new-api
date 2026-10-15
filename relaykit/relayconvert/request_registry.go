@@ -1,13 +1,13 @@
 package relayconvert
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"reflect"
 	"strings"
 	"sync"
 
-	"context"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
 	claudemessages "github.com/QuantumNous/new-api/relaykit/relayconvert/internal/claude_messages"
@@ -312,10 +312,17 @@ func executeRequestSteps(c context.Context, info convmeta.Meta, from types.Relay
 func responsesToolState(tools toolconv.Set) *convmeta.ResponsesToolState {
 	names := toolconv.ResponsesCustomToolNames(tools)
 	namespaces := toolconv.ResponsesToolNamespaces(tools)
-	if len(names) == 0 && len(namespaces) == 0 {
+	toolSearch := toolconv.ResponsesHasToolSearch(tools)
+	if len(names) == 0 && len(namespaces) == 0 && !toolSearch {
 		return nil
 	}
-	return &convmeta.ResponsesToolState{CustomToolNames: names, Namespaces: namespaces}
+	functions := make(map[string]struct{})
+	for _, definition := range tools.Definitions {
+		if definition.Kind == toolconv.KindFunction && definition.Function != nil {
+			functions[definition.Function.Name] = struct{}{}
+		}
+	}
+	return &convmeta.ResponsesToolState{CustomToolNames: names, FunctionToolNames: functions, Namespaces: namespaces, ToolSearch: toolSearch}
 }
 
 func expandRequestConverterSteps(spec RequestConverterSpec) ([]RequestConverterSpec, error) {
@@ -516,7 +523,7 @@ func convertOpenAIResponsesRequestToGeminiChat(c context.Context, info convmeta.
 	return oairesponses.OpenAIResponsesRequestToGeminiChat(c, responsesRequest, info)
 }
 
-func convertResponsesRequestToChat(c context.Context, _ convmeta.Meta, request any) (any, error) {
+func convertResponsesRequestToChat(c context.Context, info convmeta.Meta, request any) (any, error) {
 	responsesRequest, ok := request.(*dto.OpenAIResponsesRequest)
 	if !ok {
 		if value, ok := request.(dto.OpenAIResponsesRequest); ok {
@@ -526,5 +533,18 @@ func convertResponsesRequestToChat(c context.Context, _ convmeta.Meta, request a
 	if responsesRequest == nil {
 		return nil, fmt.Errorf("expected OpenAI responses request, got %T", request)
 	}
-	return oairesponses.ResponsesRequestToChatCompletionsRequest(c, responsesRequest)
+	return oairesponses.ResponsesRequestToChatCompletionsRequestWithOptions(c, responsesRequest, convmeta.OptionsOf(info))
+}
+
+func convertClaudeRequestToGemini(c context.Context, info convmeta.Meta, request any) (any, error) {
+	value, ok := request.(*dto.ClaudeRequest)
+	if !ok {
+		if v, valid := request.(dto.ClaudeRequest); valid {
+			value = &v
+		}
+	}
+	if value == nil {
+		return nil, fmt.Errorf("expected Claude request, got %T", request)
+	}
+	return claudemessages.ClaudeMessagesRequestToGemini(c, *value, info)
 }

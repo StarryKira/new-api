@@ -26,6 +26,9 @@ func UsageFromOpenAI(usage *dto.Usage) *dto.ClaudeUsage {
 		usage.ClaudeCacheCreation1hTokens,
 	)
 	cacheCreationTokens := usage.PromptTokensDetails.CacheCreationTokensTotal()
+	if cacheCreationTokens == 0 {
+		cacheCreationTokens = usage.LegacyCacheCreationInputTokens
+	}
 	inputTokens := usage.PromptTokens
 	if usage.UsageSemantic != dto.BillingUsageSemanticAnthropic {
 		// OpenAI-style prompt/input totals include cache reads and writes, while

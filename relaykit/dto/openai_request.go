@@ -75,6 +75,7 @@ type GeneralOpenAIRequest struct {
 	// Used by OpenAI to cache responses for similar requests to optimize your cache hit rates. Replaces the user field
 	PromptCacheKey       string          `json:"prompt_cache_key,omitempty"`
 	PromptCacheRetention json.RawMessage `json:"prompt_cache_retention,omitempty"`
+	PromptCacheOptions   json.RawMessage `json:"prompt_cache_options,omitempty"`
 	LogitBias            json.RawMessage `json:"logit_bias,omitempty"`
 	Metadata             json.RawMessage `json:"metadata,omitempty"`
 	Prediction           json.RawMessage `json:"prediction,omitempty"`
@@ -404,10 +405,11 @@ func (r *GeneralOpenAIRequest) GetSystemRoleName() string {
 const CustomType = "custom"
 
 type ToolCallRequest struct {
-	ID       string          `json:"id,omitempty"`
-	Type     string          `json:"type"`
-	Function FunctionRequest `json:"function"`
-	Custom   json.RawMessage `json:"custom,omitempty"`
+	ExtraContent *ExtraContent   `json:"extra_content,omitempty"`
+	ID           string          `json:"id,omitempty"`
+	Type         string          `json:"type"`
+	Function     FunctionRequest `json:"function"`
+	Custom       json.RawMessage `json:"custom,omitempty"`
 	// Native is a complete vendor tool object sent instead of the fields
 	// above. Function has no omitempty, so a non-function tool would
 	// otherwise carry "function":{"name":""}, which vendor schemas with
@@ -421,6 +423,19 @@ func (t ToolCallRequest) MarshalJSON() ([]byte, error) {
 	}
 	type Alias ToolCallRequest
 	return kitutil.Marshal((*Alias)(&t))
+}
+
+func (t *ToolCallRequest) UnmarshalJSON(data []byte) error {
+	type plain ToolCallRequest
+	var value plain
+	if err := kitutil.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	*t = ToolCallRequest(value)
+	if t.Type != "" && t.Type != "function" {
+		t.Native = append(json.RawMessage(nil), data...)
+	}
+	return nil
 }
 
 type FunctionRequest struct {
@@ -469,14 +484,17 @@ func (r *GeneralOpenAIRequest) ParseInput() []string {
 }
 
 type Message struct {
-	Role             string          `json:"role"`
-	Content          any             `json:"content"`
-	Name             *string         `json:"name,omitempty"`
-	Prefix           *bool           `json:"prefix,omitempty"`
-	ReasoningContent *string         `json:"reasoning_content,omitempty"`
-	Reasoning        *string         `json:"reasoning,omitempty"`
-	ToolCalls        json.RawMessage `json:"tool_calls,omitempty"`
-	ToolCallId       string          `json:"tool_call_id,omitempty"`
+	Refusal            *string         `json:"refusal,omitempty"`
+	ReasoningSignature string          `json:"reasoning_signature,omitempty"`
+	Role               string          `json:"role"`
+	Content            any             `json:"content"`
+	Name               *string         `json:"name,omitempty"`
+	Prefix             *bool           `json:"prefix,omitempty"`
+	ReasoningContent   *string         `json:"reasoning_content,omitempty"`
+	Reasoning          *string         `json:"reasoning,omitempty"`
+	ToolCalls          json.RawMessage `json:"tool_calls,omitempty"`
+	FunctionCall       json.RawMessage `json:"function_call,omitempty"`
+	ToolCallId         string          `json:"tool_call_id,omitempty"`
 	// Tools carries Kimi K3 dynamic tool loading declarations on a system message.
 	// Same shape as the top-level tools array; passthrough-only for OpenAI-compatible upstreams.
 	Tools json.RawMessage `json:"tools,omitempty"`
@@ -488,12 +506,13 @@ type Message struct {
 }
 
 type MediaContent struct {
-	Type       string `json:"type"`
-	Text       string `json:"text,omitempty"`
-	ImageUrl   any    `json:"image_url,omitempty"`
-	InputAudio any    `json:"input_audio,omitempty"`
-	File       any    `json:"file,omitempty"`
-	VideoUrl   any    `json:"video_url,omitempty"`
+	PromptCacheBreakpoint json.RawMessage `json:"prompt_cache_breakpoint,omitempty"`
+	Type                  string          `json:"type"`
+	Text                  string          `json:"text,omitempty"`
+	ImageUrl              any             `json:"image_url,omitempty"`
+	InputAudio            any             `json:"input_audio,omitempty"`
+	File                  any             `json:"file,omitempty"`
+	VideoUrl              any             `json:"video_url,omitempty"`
 	// OpenRouter Params
 	CacheControl json.RawMessage `json:"cache_control,omitempty"`
 }
@@ -765,7 +784,12 @@ func (m *Message) ParseContent() []MediaContent {
 			continue
 		}
 
+		before := len(contentList)
 		switch contentType {
+		case "thinking":
+			if thinking, ok := contentItem["thinking"].(string); ok {
+				contentList = append(contentList, MediaContent{Type: "thinking", Text: thinking})
+			}
 		case ContentTypeText:
 			if text, ok := contentItem["text"].(string); ok {
 				contentList = append(contentList, MediaContent{
@@ -844,6 +868,15 @@ func (m *Message) ParseContent() []MediaContent {
 						Url: videoUrl,
 					},
 				})
+			}
+		}
+		if len(contentList) > before {
+			last := &contentList[len(contentList)-1]
+			if value, ok := contentItem["prompt_cache_breakpoint"]; ok {
+				last.PromptCacheBreakpoint, _ = kitutil.Marshal(value)
+			}
+			if value, ok := contentItem["cache_control"]; ok {
+				last.CacheControl, _ = kitutil.Marshal(value)
 			}
 		}
 	}

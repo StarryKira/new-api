@@ -122,6 +122,27 @@ func ApplyThinkingConfig(ctx context.Context, geminiRequest *dto.GeminiChatReque
 		convdiag.Add(ctx, diagnostics...)
 	}
 
+	if opts.Gemini.BudgetOnlyThinking && crossProtocol {
+		// CodeAssist-compatible gateways expose budget controls even for model
+		// names absent from the public Gemini capability table.
+		if source.Mode == reasoning.ModeDisabled || source.Effort == reasoning.EffortNone {
+			geminiRequest.GenerationConfig.ThinkingConfig = nil
+			return nil
+		}
+		if !source.IsEmpty() {
+			budget := -1
+			if source.BudgetTokens != nil && *source.BudgetTokens > 0 {
+				budget = *source.BudgetTokens
+			}
+			include := true
+			if source.IncludeThoughts != nil {
+				include = *source.IncludeThoughts
+			}
+			geminiRequest.GenerationConfig.ThinkingConfig = &dto.GeminiThinkingConfig{ThinkingBudget: &budget, IncludeThoughts: &include}
+		}
+		return nil
+	}
+
 	baseModel := modelName
 	suffix := reasoning.IntentFromState(convmeta.ReasoningStateOf(info))
 	preserveSuffix := opts.ShouldPreserveThinkingSuffix(modelName)

@@ -19,13 +19,31 @@ func ClaudeMessagesRequestToOpenAIResponses(ctx context.Context, claudeRequest d
 		return nil, errors.New("model is required")
 	}
 
-	input, err := claudeMessagesToResponsesInput(claudeRequest.Messages)
+	input, err := claudeMessagesToResponsesInput(claudeRequest.Messages, claudeRequest.Model)
 	if err != nil {
 		return nil, err
 	}
 	instructions, err := claudeSystemToResponsesInstructions(&claudeRequest)
 	if err != nil {
 		return nil, err
+	}
+	if convmeta.OptionsOf(info).ResponsesSystemAsInput && len(instructions) > 0 {
+		systemInput, err := claudeMessagesToResponsesInput([]dto.ClaudeMessage{{Role: "developer", Content: claudeRequest.System}}, claudeRequest.Model)
+		if err != nil {
+			return nil, err
+		}
+		var systemItems, messageItems []json.RawMessage
+		if err := kitutil.Unmarshal(systemInput, &systemItems); err != nil {
+			return nil, err
+		}
+		if err := kitutil.Unmarshal(input, &messageItems); err != nil {
+			return nil, err
+		}
+		input, err = kitutil.Marshal(append(systemItems, messageItems...))
+		if err != nil {
+			return nil, err
+		}
+		instructions = nil
 	}
 	tools, err := claudeToolsToResponsesTools(claudeRequest.Tools)
 	if err != nil {
@@ -128,7 +146,7 @@ func claudeSystemToResponsesInstructions(request *dto.ClaudeRequest) (json.RawMe
 	return kitutil.Marshal(instructions.String())
 }
 
-func claudeMessagesToResponsesInput(messages []dto.ClaudeMessage) (json.RawMessage, error) {
+func claudeMessagesToResponsesInput(messages []dto.ClaudeMessage, models ...string) (json.RawMessage, error) {
 	input := make([]map[string]any, 0, len(messages))
 	for messageIndex := range messages {
 		message := messages[messageIndex]
@@ -138,6 +156,7 @@ func claudeMessagesToResponsesInput(messages []dto.ClaudeMessage) (json.RawMessa
 		}
 		if message.IsStringContent() {
 			input = append(input, map[string]any{
+				"type":    "message",
 				"role":    role,
 				"content": message.GetStringContent(),
 			})
@@ -154,6 +173,7 @@ func claudeMessagesToResponsesInput(messages []dto.ClaudeMessage) (json.RawMessa
 				return
 			}
 			input = append(input, map[string]any{
+				"type":    "message",
 				"role":    role,
 				"content": contentParts,
 			})
@@ -163,6 +183,19 @@ func claudeMessagesToResponsesInput(messages []dto.ClaudeMessage) (json.RawMessa
 		for blockIndex := range blocks {
 			block := blocks[blockIndex]
 			switch block.Type {
+			case "thinking":
+				// On this request route the target is a Responses upstream. The
+				// signature was carried through Claude's wire format by the
+				// response converter and must remain provider ciphertext.
+				signature := strings.TrimSpace(block.Signature)
+				if signature == "" {
+					continue
+				}
+				if len(models) > 0 && (strings.HasPrefix(strings.ToLower(models[0]), "grok-") || strings.HasPrefix(strings.ToLower(models[0]), "x-ai/grok-")) && strings.HasPrefix(signature, "gAAAA") {
+					continue
+				}
+				flushContent()
+				input = append(input, map[string]any{"type": "reasoning", "encrypted_content": signature})
 			case "text", "input_text":
 				partType := "input_text"
 				if role == "assistant" {
@@ -326,5 +359,9 @@ func claudeSourceURL(source *dto.ClaudeMessageSource) string {
 	if strings.HasPrefix(data, "data:") {
 		return data
 	}
-	return fmt.Sprintf("data:%s;base64,%s", source.MediaType, data)
+	mediaType := source.MediaType
+	if mediaType == "" {
+		mediaType = "image/png"
+	}
+	return fmt.Sprintf("data:%s;base64,%s", mediaType, data)
 }

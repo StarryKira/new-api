@@ -12,9 +12,10 @@ import (
 const responsesEventOutputTextDone = "response.output_text.done"
 
 type ResponsesToClaudeStreamState struct {
-	ID    string
-	Model string
-	Usage *dto.Usage
+	ClaudeCodeReadEmptyPages bool
+	ID                       string
+	Model                    string
+	Usage                    *dto.Usage
 
 	sentMessageStart bool
 	done             bool
@@ -24,6 +25,8 @@ type ResponsesToClaudeStreamState struct {
 	byOutputIndex    map[int]*responsesClaudeStreamBlock
 	byItemID         map[string]*responsesClaudeStreamBlock
 	lastByKind       map[string]*responsesClaudeStreamBlock
+	textByOutputPart map[string]*responsesClaudeStreamBlock
+	textByItemPart   map[string]*responsesClaudeStreamBlock
 	usageText        strings.Builder
 }
 
@@ -39,15 +42,19 @@ type responsesClaudeStreamBlock struct {
 	SentBytes           int
 	AnnotationCount     int
 	NeedsReasoningBreak bool
+	Signature           string
+	Data                string
 }
 
 func NewResponsesToClaudeStreamState(id string, model string) *ResponsesToClaudeStreamState {
 	return &ResponsesToClaudeStreamState{
-		ID:            strings.TrimSpace(id),
-		Model:         strings.TrimSpace(model),
-		byOutputIndex: make(map[int]*responsesClaudeStreamBlock),
-		byItemID:      make(map[string]*responsesClaudeStreamBlock),
-		lastByKind:    make(map[string]*responsesClaudeStreamBlock),
+		ID:               strings.TrimSpace(id),
+		Model:            strings.TrimSpace(model),
+		byOutputIndex:    make(map[int]*responsesClaudeStreamBlock),
+		byItemID:         make(map[string]*responsesClaudeStreamBlock),
+		lastByKind:       make(map[string]*responsesClaudeStreamBlock),
+		textByOutputPart: make(map[string]*responsesClaudeStreamBlock),
+		textByItemPart:   make(map[string]*responsesClaudeStreamBlock),
 	}
 }
 
@@ -88,6 +95,9 @@ func (s *ResponsesToClaudeStreamState) ConvertChunk(event *dto.ResponsesStreamRe
 	}
 
 	s.applyResponseMetadata(event.Response)
+	if event.Usage != nil {
+		s.Usage = dto.MergeUsageNonZero(s.Usage, UsageFromResponsesUsage(event.Usage))
+	}
 	switch event.Type {
 	case responsesEventCreated:
 		return s.ensureMessageStart(estimatedInputTokens), s.Usage, nil
@@ -122,14 +132,20 @@ func (s *ResponsesToClaudeStreamState) ConvertChunk(event *dto.ResponsesStreamRe
 		}
 		return s.appendDelta(block, event.Delta, estimatedInputTokens), s.Usage, nil
 	case responsesEventOutputTextDone:
+		// A done frame with an unrelated identity cannot safely replay text.
+		if s.findBlock(event) == nil && s.hasSentText() {
+			return nil, s.Usage, nil
+		}
 		block, err := s.ensureBlock(event, "text")
 		if err != nil {
 			return nil, s.Usage, err
 		}
-		if event.Text == nil {
-			return nil, s.Usage, nil
+		var responses []*dto.ClaudeResponse
+		if event.Text != nil {
+			responses = append(responses, s.mergeFinalValue(block, *event.Text, estimatedInputTokens)...)
 		}
-		return s.mergeFinalValue(block, *event.Text, estimatedInputTokens), s.Usage, nil
+		responses = append(responses, s.stopBlock(block, estimatedInputTokens)...)
+		return responses, s.Usage, nil
 	case responsesEventOutputTextAnnotationAdded:
 		block, err := s.ensureBlock(event, "text")
 		if err != nil {
@@ -154,10 +170,16 @@ func (s *ResponsesToClaudeStreamState) ConvertChunk(event *dto.ResponsesStreamRe
 		if err != nil {
 			return nil, s.Usage, err
 		}
-		if event.Arguments == nil {
-			return nil, s.Usage, nil
+		var responses []*dto.ClaudeResponse
+		arguments := event.Arguments
+		if event.Type == responsesEventCustomToolInputDone {
+			arguments = event.Input
 		}
-		return s.mergeFinalValue(block, *event.Arguments, estimatedInputTokens), s.Usage, nil
+		if arguments != nil {
+			responses = append(responses, s.mergeFinalValue(block, *arguments, estimatedInputTokens)...)
+		}
+		responses = append(responses, s.stopBlock(block, estimatedInputTokens)...)
+		return responses, s.Usage, nil
 	case responsesEventCompleted, responsesEventDone, responsesEventIncomplete:
 		responses, err := s.finish(event.Response, estimatedInputTokens)
 		return responses, s.Usage, err
@@ -243,13 +265,27 @@ func (s *ResponsesToClaudeStreamState) findBlock(event *dto.ResponsesStreamRespo
 	if event == nil {
 		return nil
 	}
+	part := 0
+	if event.ContentIndex != nil {
+		part = *event.ContentIndex
+	}
 	if event.OutputIndex != nil {
-		if block := s.byOutputIndex[*event.OutputIndex]; block != nil {
+		if block := s.textByOutputPart[fmt.Sprintf("%d:%d", *event.OutputIndex, part)]; block != nil {
 			return block
+		}
+		if event.ContentIndex == nil {
+			if block := s.byOutputIndex[*event.OutputIndex]; block != nil {
+				return block
+			}
 		}
 	}
 	if itemID := responseStreamEventItemID(event); itemID != "" {
-		return s.byItemID[itemID]
+		if block := s.textByItemPart[fmt.Sprintf("%s:%d", itemID, part)]; block != nil {
+			return block
+		}
+		if event.ContentIndex == nil {
+			return s.byItemID[itemID]
+		}
 	}
 	return nil
 }
@@ -258,12 +294,24 @@ func (s *ResponsesToClaudeStreamState) applyBlockMetadata(block *responsesClaude
 	if block == nil || event == nil {
 		return
 	}
+	part := 0
+	if event.ContentIndex != nil {
+		part = *event.ContentIndex
+	}
 	if event.OutputIndex != nil {
-		s.byOutputIndex[*event.OutputIndex] = block
+		if block.Kind == "text" {
+			s.textByOutputPart[fmt.Sprintf("%d:%d", *event.OutputIndex, part)] = block
+		} else {
+			s.byOutputIndex[*event.OutputIndex] = block
+		}
 	}
 	if itemID := responseStreamEventItemID(event); itemID != "" {
 		block.ItemID = itemID
-		s.byItemID[itemID] = block
+		if block.Kind == "text" {
+			s.textByItemPart[fmt.Sprintf("%s:%d", itemID, part)] = block
+		} else {
+			s.byItemID[itemID] = block
+		}
 	}
 	if event.Item == nil {
 		return
@@ -288,6 +336,8 @@ func (s *ResponsesToClaudeStreamState) startBlock(block *responsesClaudeStreamBl
 		content = dto.ClaudeMediaMessage{Type: "text", Text: kitutil.GetPointer("")}
 	case "thinking":
 		content = dto.ClaudeMediaMessage{Type: "thinking", Thinking: kitutil.GetPointer("")}
+	case "redacted_thinking":
+		content = dto.ClaudeMediaMessage{Type: "redacted_thinking", Data: block.Data}
 	case "tool_use":
 		if block.Name == "" {
 			return nil
@@ -301,8 +351,15 @@ func (s *ResponsesToClaudeStreamState) startBlock(block *responsesClaudeStreamBl
 	default:
 		return nil
 	}
-	block.Started = true
 	responses := s.ensureMessageStart(estimatedInputTokens)
+	// Text and thinking blocks are sequential; parallel tool calls may retain
+	// independent indexes until their arguments finish.
+	for _, previous := range s.blocks {
+		if previous != block && previous.Started && !previous.Stopped && (previous.Kind != "tool_use" || block.Kind != "tool_use") {
+			responses = append(responses, s.stopBlock(previous, estimatedInputTokens)...)
+		}
+	}
+	block.Started = true
 	index := block.Index
 	responses = append(responses, &dto.ClaudeResponse{Type: "content_block_start", Index: &index, ContentBlock: &content})
 	return responses
@@ -317,10 +374,21 @@ func (s *ResponsesToClaudeStreamState) appendDelta(block *responsesClaudeStreamB
 }
 
 func (s *ResponsesToClaudeStreamState) mergeFinalValue(block *responsesClaudeStreamBlock, finalValue string, estimatedInputTokens int) []*dto.ClaudeResponse {
-	if block == nil || block.Stopped {
+	if block == nil {
 		return nil
 	}
 	current := block.Value.String()
+	if block.Stopped {
+		if block.Kind != "text" || !strings.HasPrefix(finalValue, current) || len(finalValue) <= len(current) {
+			return nil
+		}
+		// A late authoritative done payload can add a suffix after the old
+		// Claude block closed; start a fresh block and retain the text ledger.
+		block.Index = s.nextBlockIndex
+		s.nextBlockIndex++
+		block.Started = false
+		block.Stopped = false
+	}
 	if current == "" {
 		block.Value.WriteString(finalValue)
 	} else if strings.HasPrefix(finalValue, current) {
@@ -342,6 +410,12 @@ func (s *ResponsesToClaudeStreamState) flushBlock(block *responsesClaudeStreamBl
 		return responses
 	}
 	delta := value[block.SentBytes:]
+	if s.ClaudeCodeReadEmptyPages && block.Kind == "tool_use" && block.Name == "Read" {
+		if block.SentBytes != 0 || !kitutil.Valid([]byte(value)) {
+			return responses
+		}
+		delta = sharedclaude.ClaudeCodeReadInput(block.Name, value)
+	}
 	block.SentBytes = len(value)
 	s.usageText.WriteString(delta)
 	index := block.Index
@@ -370,8 +444,11 @@ func (s *ResponsesToClaudeStreamState) stopBlock(block *responsesClaudeStreamBlo
 	if !block.Started {
 		return responses
 	}
-	block.Stopped = true
 	index := block.Index
+	if block.Kind == "thinking" && block.Signature != "" {
+		responses = append(responses, &dto.ClaudeResponse{Type: "content_block_delta", Index: &index, Delta: &dto.ClaudeMediaMessage{Type: "signature_delta", Signature: block.Signature}})
+	}
+	block.Stopped = true
 	return append(responses, &dto.ClaudeResponse{Type: "content_block_stop", Index: &index})
 }
 
@@ -394,6 +471,36 @@ func (s *ResponsesToClaudeStreamState) applyOutputItem(event *dto.ResponsesStrea
 	default:
 		return nil, nil
 	}
+	// Responses messages may have several independently streamed text parts.
+	// Keep each part's ledger after its Claude block closes to prevent replay.
+	if kind == "text" {
+		var responses []*dto.ClaudeResponse
+		for index, content := range item.Content {
+			if content.Type != "output_text" {
+				continue
+			}
+			partEvent := *event
+			partEvent.ContentIndex = kitutil.GetPointer(index)
+			block, err := s.ensureBlock(&partEvent, kind)
+			if err != nil {
+				return nil, err
+			}
+			responses = append(responses, s.mergeFinalValue(block, content.Text, estimatedInputTokens)...)
+			responses = append(responses, s.appendAnnotations(block, content.Annotations, estimatedInputTokens, true)...)
+			if stop {
+				responses = append(responses, s.stopBlock(block, estimatedInputTokens)...)
+			}
+		}
+		return responses, nil
+	}
+	if kind == "thinking" {
+		if reasoningOutputText(item) == "" && item.EncryptedContent == "" {
+			return nil, nil
+		}
+		if native, ok := sharedclaude.DecodeThinkingBlock(item.EncryptedContent); ok && native.Type == "redacted_thinking" {
+			kind = "redacted_thinking"
+		}
+	}
 	block, err := s.ensureBlock(event, kind)
 	if err != nil {
 		return nil, err
@@ -401,7 +508,21 @@ func (s *ResponsesToClaudeStreamState) applyOutputItem(event *dto.ResponsesStrea
 	var responses []*dto.ClaudeResponse
 	switch kind {
 	case "thinking":
-		responses = append(responses, s.mergeFinalValue(block, reasoningOutputText(item), estimatedInputTokens)...)
+		thinking := reasoningOutputText(item)
+		if native, ok := sharedclaude.DecodeThinkingBlock(item.EncryptedContent); ok {
+			block.Signature = native.Signature
+			if native.Thinking != nil {
+				thinking = *native.Thinking
+			}
+		} else if item.EncryptedContent != "" {
+			block.Signature = item.EncryptedContent
+		}
+		responses = append(responses, s.mergeFinalValue(block, thinking, estimatedInputTokens)...)
+	case "redacted_thinking":
+		if native, ok := sharedclaude.DecodeThinkingBlock(item.EncryptedContent); ok {
+			block.Data = native.Data
+		}
+		responses = append(responses, s.startBlock(block, estimatedInputTokens)...)
 	case "text":
 		var text strings.Builder
 		var annotations []any
@@ -459,11 +580,15 @@ func (s *ResponsesToClaudeStreamState) finish(response *dto.OpenAIResponsesRespo
 	}
 	s.applyResponseMetadata(response)
 	responses := make([]*dto.ClaudeResponse, 0)
+	hadSentText := s.hasSentText()
 	if response != nil {
 		for outputIndex := range response.Output {
 			index := outputIndex
 			item := response.Output[outputIndex]
 			event := &dto.ResponsesStreamResponse{OutputIndex: &index, ItemID: item.ID, Item: &item}
+			if hadSentText && item.Type == responsesOutputTypeMessage {
+				continue
+			}
 			itemResponses, err := s.applyOutputItem(event, estimatedInputTokens, true)
 			if err != nil {
 				return nil, err
@@ -497,4 +622,13 @@ func separatedResponsesDelta(delta string) string {
 		return "\n" + delta
 	}
 	return "\n\n" + delta
+}
+
+func (s *ResponsesToClaudeStreamState) hasSentText() bool {
+	for _, block := range s.blocks {
+		if block.Kind == "text" && block.SentBytes > 0 {
+			return true
+		}
+	}
+	return false
 }

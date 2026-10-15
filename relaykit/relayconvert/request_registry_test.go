@@ -113,10 +113,6 @@ func TestRequestConverterRegistryListsSupportedTextConverters(t *testing.T) {
 			from:      types.RelayFormatClaude,
 			to:        types.RelayFormatGemini,
 			quality:   RequestConverterQualityDiscouraged,
-			stepConverters: []string{
-				ConverterClaudeMessagesToOpenAIChat,
-				ConverterOpenAIChatToGeminiContent,
-			},
 		},
 		{
 			converter:      requestConverterClaudeToResponses,

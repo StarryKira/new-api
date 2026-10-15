@@ -39,13 +39,14 @@ type OpenAITextResponseChoice struct {
 }
 
 type OpenAITextResponse struct {
-	Id      string                     `json:"id"`
-	Model   string                     `json:"model"`
-	Object  string                     `json:"object"`
-	Created any                        `json:"created"`
-	Choices []OpenAITextResponseChoice `json:"choices"`
-	Error   any                        `json:"error,omitempty"`
-	Usage   `json:"usage"`
+	ServiceTier string                     `json:"service_tier,omitempty"`
+	Id          string                     `json:"id"`
+	Model       string                     `json:"model"`
+	Object      string                     `json:"object"`
+	Created     any                        `json:"created"`
+	Choices     []OpenAITextResponseChoice `json:"choices"`
+	Error       any                        `json:"error,omitempty"`
+	Usage       `json:"usage"`
 }
 
 // GetOpenAIError 从动态错误类型中提取OpenAIError结构
@@ -87,11 +88,13 @@ type ChatCompletionsStreamResponseChoice struct {
 }
 
 type ChatCompletionsStreamResponseChoiceDelta struct {
-	Content          *string            `json:"content,omitempty"`
-	ReasoningContent *string            `json:"reasoning_content,omitempty"`
-	Reasoning        *string            `json:"reasoning,omitempty"`
-	Role             string             `json:"role,omitempty"`
-	ToolCalls        []ToolCallResponse `json:"tool_calls,omitempty"`
+	Refusal            *string            `json:"refusal,omitempty"`
+	ReasoningSignature string             `json:"reasoning_signature,omitempty"`
+	Content            *string            `json:"content,omitempty"`
+	ReasoningContent   *string            `json:"reasoning_content,omitempty"`
+	Reasoning          *string            `json:"reasoning,omitempty"`
+	Role               string             `json:"role,omitempty"`
+	ToolCalls          []ToolCallResponse `json:"tool_calls,omitempty"`
 	// Annotations is an OpenAI-compatible streaming extension supported by
 	// providers such as OpenRouter. Relaykit uses it to preserve streaming URL
 	// citations, including Claude round-trip metadata.
@@ -125,6 +128,7 @@ func (c *ChatCompletionsStreamResponseChoiceDelta) SetReasoningContent(s string)
 }
 
 type ToolCallResponse struct {
+	ExtraContent *ExtraContent `json:"extra_content,omitempty"`
 	// Index is not nil only in chat completion chunk object
 	Index    *int             `json:"index,omitempty"`
 	ID       string           `json:"id,omitempty"`
@@ -145,6 +149,7 @@ type FunctionResponse struct {
 }
 
 type ChatCompletionsStreamResponse struct {
+	ServiceTier       string                                `json:"service_tier,omitempty"`
 	Id                string                                `json:"id"`
 	Object            string                                `json:"object"`
 	Created           int64                                 `json:"created"`
@@ -226,13 +231,14 @@ type CompletionsStreamResponse struct {
 }
 
 type Usage struct {
-	PromptTokens         int           `json:"prompt_tokens"`
-	CompletionTokens     int           `json:"completion_tokens"`
-	TotalTokens          int           `json:"total_tokens"`
-	PromptCacheHitTokens int           `json:"prompt_cache_hit_tokens,omitempty"`
-	UsageSemantic        string        `json:"usage_semantic,omitempty"`
-	UsageSource          string        `json:"usage_source,omitempty"`
-	BillingUsage         *BillingUsage `json:"billing_usage,omitempty"`
+	LegacyCacheCreationInputTokens int           `json:"cache_creation_input_tokens,omitempty"`
+	PromptTokens                   int           `json:"prompt_tokens"`
+	CompletionTokens               int           `json:"completion_tokens"`
+	TotalTokens                    int           `json:"total_tokens"`
+	PromptCacheHitTokens           int           `json:"prompt_cache_hit_tokens,omitempty"`
+	UsageSemantic                  string        `json:"usage_semantic,omitempty"`
+	UsageSource                    string        `json:"usage_source,omitempty"`
+	BillingUsage                   *BillingUsage `json:"billing_usage,omitempty"`
 
 	PromptTokensDetails    InputTokenDetails   `json:"prompt_tokens_details"`
 	CompletionTokenDetails OutputTokenDetails  `json:"completion_tokens_details"`
@@ -322,13 +328,16 @@ func (d InputTokenDetails) CacheCreationTokensTotal() int {
 }
 
 type OutputTokenDetails struct {
-	TextTokens      int `json:"text_tokens"`
-	AudioTokens     int `json:"audio_tokens"`
-	ImageTokens     int `json:"image_tokens"`
-	ReasoningTokens int `json:"reasoning_tokens"`
+	AcceptedPredictionTokens int `json:"accepted_prediction_tokens,omitempty"`
+	RejectedPredictionTokens int `json:"rejected_prediction_tokens,omitempty"`
+	TextTokens               int `json:"text_tokens"`
+	AudioTokens              int `json:"audio_tokens"`
+	ImageTokens              int `json:"image_tokens"`
+	ReasoningTokens          int `json:"reasoning_tokens"`
 }
 
 type OpenAIResponsesResponse struct {
+	ServiceTier        string             `json:"service_tier,omitempty"`
 	ID                 string             `json:"id"`
 	Object             string             `json:"object"`
 	CreatedAt          IntValue           `json:"created_at"`
@@ -363,6 +372,8 @@ type IncompleteDetails struct {
 }
 
 type ResponsesOutput struct {
+	Execution           string                          `json:"execution,omitempty"`
+	EncryptedContent    string                          `json:"encrypted_content,omitempty"`
 	Type                string                          `json:"type"`
 	ID                  string                          `json:"id"`
 	Status              string                          `json:"status"`
@@ -399,6 +410,19 @@ type ResponsesOutput struct {
 // custom_tool_call items.
 func (r ResponsesOutput) MarshalJSON() ([]byte, error) {
 	switch r.Type {
+	case "tool_search_call":
+		arguments := r.Arguments
+		if len(arguments) == 0 {
+			arguments = json.RawMessage(`{}`)
+		}
+		return kitutil.Marshal(struct {
+			Type      string          `json:"type"`
+			ID        string          `json:"id"`
+			Status    string          `json:"status,omitempty"`
+			CallID    string          `json:"call_id,omitempty"`
+			Arguments json.RawMessage `json:"arguments"`
+			Execution string          `json:"execution,omitempty"`
+		}{r.Type, r.ID, r.Status, r.CallId, arguments, r.Execution})
 	case "custom_tool_call":
 		input := r.Input
 		if len(input) == 0 {
@@ -533,14 +557,16 @@ func ResponsesArgumentsString(arguments json.RawMessage) string {
 }
 
 type ResponsesOutputContent struct {
+	Refusal     string `json:"refusal,omitempty"`
 	Type        string `json:"type"`
 	Text        string `json:"text"`
 	Annotations []any  `json:"annotations"`
 }
 
 type ResponsesReasoningSummaryPart struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Annotations *[]any `json:"annotations,omitempty"`
+	Type        string `json:"type"`
+	Text        string `json:"text"`
 }
 
 const (
@@ -565,6 +591,9 @@ const (
 
 // ResponsesStreamResponse 用于处理 /v1/responses 流式响应
 type ResponsesStreamResponse struct {
+	Refusal         *string                  `json:"refusal,omitempty"`
+	CallID          string                   `json:"call_id,omitempty"`
+	Usage           *Usage                   `json:"usage,omitempty"`
 	Type            string                   `json:"type"`
 	Response        *OpenAIResponsesResponse `json:"response,omitempty"`
 	Code            string                   `json:"code,omitempty"`
@@ -631,4 +660,22 @@ func GetOpenAIError(errorField any) *types.OpenAIError {
 			Message: fmt.Sprintf("%v", err),
 		}
 	}
+}
+
+// UnmarshalJSON accepts compatibility cache-write aliases while preserving the
+// library's canonical spelling on output.
+func (d *InputTokenDetails) UnmarshalJSON(data []byte) error {
+	type plain InputTokenDetails
+	var value struct {
+		plain
+		CacheCreationTokens *int `json:"cache_creation_tokens"`
+	}
+	if err := kitutil.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	*d = InputTokenDetails(value.plain)
+	if d.CachedCreationTokens == 0 && value.CacheCreationTokens != nil {
+		d.CachedCreationTokens = *value.CacheCreationTokens
+	}
+	return nil
 }

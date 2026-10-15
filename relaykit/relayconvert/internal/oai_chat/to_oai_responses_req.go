@@ -105,7 +105,18 @@ func ChatCompletionsRequestToResponsesRequest(ctx context.Context, req *dto.Gene
 			} else if msg.IsStringContent() {
 				output = msg.StringContent()
 			} else {
-				if b, err := kitutil.Marshal(msg.Content); err == nil {
+				parts := make([]map[string]any, 0)
+				for _, part := range msg.ParseContent() {
+					switch part.Type {
+					case dto.ContentTypeText:
+						parts = append(parts, map[string]any{"type": "input_text", "text": part.Text})
+					case dto.ContentTypeImageURL:
+						parts = append(parts, map[string]any{"type": "input_image", "image_url": normalizeChatImageURLToString(part.ImageUrl)})
+					}
+				}
+				if len(parts) > 0 {
+					output = parts
+				} else if b, err := kitutil.Marshal(msg.Content); err == nil {
 					output = string(b)
 				} else {
 					output = fmt.Sprintf("%v", msg.Content)
@@ -128,8 +139,18 @@ func ChatCompletionsRequestToResponsesRequest(ctx context.Context, req *dto.Gene
 			continue
 		}
 
-		// Prefer mapping system/developer messages into `instructions`.
-		if role == "system" || role == "developer" {
+		// System instructions can be hoisted, but developer messages retain their
+		// role and position in the conversation.
+		textOnlySystem := true
+		if role == "system" && !msg.IsStringContent() {
+			for _, part := range msg.ParseContent() {
+				if part.Type != dto.ContentTypeText || len(part.PromptCacheBreakpoint) > 0 || len(part.CacheControl) > 0 {
+					textOnlySystem = false
+					break
+				}
+			}
+		}
+		if role == "system" && textOnlySystem {
 			if msg.Content == nil {
 				continue
 			}
@@ -155,13 +176,19 @@ func ChatCompletionsRequestToResponsesRequest(ctx context.Context, req *dto.Gene
 			continue
 		}
 
+		if role == "assistant" && msg.GetReasoningContent() != "" {
+			inputItems = append(inputItems, map[string]any{"type": "reasoning", "summary": []map[string]any{{"type": "summary_text", "text": msg.GetReasoningContent()}}})
+		}
 		item := map[string]any{
+			"type": "message",
 			"role": role,
 		}
 
 		if msg.Content == nil {
 			item["content"] = ""
-			inputItems = append(inputItems, item)
+			if role != "assistant" || len(msg.ParseToolCalls()) == 0 && msg.GetReasoningContent() == "" {
+				inputItems = append(inputItems, item)
+			}
 
 			if role == "assistant" {
 				for _, tc := range msg.ParseToolCalls() {
@@ -188,7 +215,9 @@ func ChatCompletionsRequestToResponsesRequest(ctx context.Context, req *dto.Gene
 
 		if msg.IsStringContent() {
 			item["content"] = msg.StringContent()
-			inputItems = append(inputItems, item)
+			if role != "assistant" || msg.StringContent() != "" || len(msg.ParseToolCalls()) == 0 {
+				inputItems = append(inputItems, item)
+			}
 
 			if role == "assistant" {
 				for _, tc := range msg.ParseToolCalls() {
@@ -216,8 +245,16 @@ func ChatCompletionsRequestToResponsesRequest(ctx context.Context, req *dto.Gene
 		parts := msg.ParseContent()
 		contentParts := make([]map[string]any, 0, len(parts))
 		for _, part := range parts {
+			before := len(contentParts)
 			switch part.Type {
+			case "thinking":
+				if role == "assistant" && part.Text != "" {
+					inputItems = append(inputItems, map[string]any{"type": "reasoning", "summary": []map[string]any{{"type": "summary_text", "text": part.Text}}})
+				}
 			case dto.ContentTypeText:
+				if part.Text == "" && len(part.PromptCacheBreakpoint) == 0 && len(part.CacheControl) == 0 {
+					continue
+				}
 				textType := "input_text"
 				if role == "assistant" {
 					textType = "output_text"
@@ -227,9 +264,15 @@ func ChatCompletionsRequestToResponsesRequest(ctx context.Context, req *dto.Gene
 					"text": part.Text,
 				})
 			case dto.ContentTypeImageURL:
+				imageURL := normalizeChatImageURLToString(part.ImageUrl)
+				if value, ok := imageURL.(string); ok {
+					if before, data, found := strings.Cut(value, ","); found && strings.HasPrefix(strings.ToLower(before), "data:") && strings.Contains(strings.ToLower(before), ";base64") && strings.TrimSpace(data) == "" {
+						continue
+					}
+				}
 				contentParts = append(contentParts, map[string]any{
 					"type":      "input_image",
-					"image_url": normalizeChatImageURLToString(part.ImageUrl),
+					"image_url": imageURL,
 				})
 			case dto.ContentTypeInputAudio:
 				contentParts = append(contentParts, map[string]any{
@@ -261,8 +304,21 @@ func ChatCompletionsRequestToResponsesRequest(ctx context.Context, req *dto.Gene
 					"type": part.Type,
 				})
 			}
+			if len(contentParts) > before {
+				last := contentParts[len(contentParts)-1]
+				if len(part.PromptCacheBreakpoint) > 0 {
+					last["prompt_cache_breakpoint"] = part.PromptCacheBreakpoint
+				}
+				if len(part.CacheControl) > 0 {
+					last["cache_control"] = part.CacheControl
+				}
+			}
 		}
-		item["content"] = contentParts
+		if len(contentParts) == 0 {
+			item["content"] = ""
+		} else {
+			item["content"] = contentParts
+		}
 		inputItems = append(inputItems, item)
 
 		if role == "assistant" {
@@ -401,24 +457,29 @@ func ChatCompletionsRequestToResponsesRequest(ctx context.Context, req *dto.Gene
 	}
 
 	out := &dto.OpenAIResponsesRequest{
-		Model:             req.Model,
-		Input:             inputRaw,
-		Instructions:      instructionsRaw,
-		Stream:            req.Stream,
-		Temperature:       req.Temperature,
-		Text:              textRaw,
-		ToolChoice:        toolChoiceRaw,
-		Tools:             toolsRaw,
-		TopP:              topP,
-		FrequencyPenalty:  frequencyPenaltyRaw,
-		PresencePenalty:   presencePenaltyRaw,
-		User:              req.User,
-		ParallelToolCalls: parallelToolCallsRaw,
-		Store:             req.Store,
-		Metadata:          req.Metadata,
-		PromptCacheKey:    promptCacheKeyRaw,
-		EnableThinking:    req.EnableThinking,
-		ThinkingBudget:    req.ThinkingBudget,
+		Model:                req.Model,
+		Input:                inputRaw,
+		Instructions:         instructionsRaw,
+		Stream:               req.Stream,
+		Temperature:          req.Temperature,
+		Text:                 textRaw,
+		ToolChoice:           toolChoiceRaw,
+		Tools:                toolsRaw,
+		TopP:                 topP,
+		FrequencyPenalty:     frequencyPenaltyRaw,
+		PresencePenalty:      presencePenaltyRaw,
+		User:                 req.User,
+		ParallelToolCalls:    parallelToolCallsRaw,
+		Store:                req.Store,
+		Metadata:             req.Metadata,
+		PromptCacheKey:       promptCacheKeyRaw,
+		PromptCacheOptions:   req.PromptCacheOptions,
+		PromptCacheRetention: req.PromptCacheRetention,
+		EnableThinking:       req.EnableThinking,
+		ThinkingBudget:       req.ThinkingBudget,
+	}
+	if len(req.ServiceTier) > 0 {
+		_ = kitutil.Unmarshal(req.ServiceTier, &out.ServiceTier)
 	}
 	if req.MaxTokens != nil || req.MaxCompletionTokens != nil {
 		out.MaxOutputTokens = lo.ToPtr(maxOutputTokens)

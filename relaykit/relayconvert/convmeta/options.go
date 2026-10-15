@@ -7,6 +7,24 @@ import "github.com/QuantumNous/new-api/relaykit/types"
 // Meta (see relaycommon.RelayInfo.ConvOptions); relaykit users fill it
 // directly. Zero value = every adaptation disabled, no defaults applied.
 type Options struct {
+	// ResponsesSystemAsInput preserves system context in input for transports that replace instructions.
+	ResponsesSystemAsInput bool
+
+	// OpenAICompatibleToolTypes lists vendor tool schemas verified identical
+	// across that provider's Chat and Responses endpoints. These tools and
+	// their choices retain their native JSON only between those two formats.
+	OpenAICompatibleToolTypes []string
+	// ReasoningOnlyAsText exposes a provider reasoning-only answer as visible
+	// text when no text or tool call was produced. Disabled for standard routes.
+	ReasoningOnlyAsText bool
+	// RepairToolHistory repairs interrupted client histories by restoring tool
+	// result adjacency and dropping unmatched calls/results before conversion.
+	RepairToolHistory bool
+
+	// ReasoningContentByID restores plaintext retained by the host when a
+	// Responses client replays an encrypted-only reasoning item.
+	ReasoningContentByID func(id string) string
+
 	Claude ClaudeOptions
 	Gemini GeminiOptions
 
@@ -40,6 +58,10 @@ type Options struct {
 }
 
 type ClaudeOptions struct {
+	// ClaudeCodeReadEmptyPages removes an invalid empty optional pages field from
+	// complete Claude Code Read arguments. Read deltas wait until valid JSON
+	// is available, then emit immediately even if the upstream omits done.
+	ClaudeCodeReadEmptyPages bool
 	// ThinkingAdapterEnabled is the host thinking-suffix adapter toggle. The
 	// host passes it to reasoning.ParseClaudeModelSuffix, so -thinking,
 	// -nothinking, -thinking-<budget>, and effort tails such as -high on
@@ -67,6 +89,18 @@ type ClaudeOptions struct {
 }
 
 type GeminiOptions struct {
+	// StringifyScalarEnums encodes scalar enum literals as strings for gateways
+	// that require Gemini typed-Schema enum values to use their string form.
+	StringifyScalarEnums bool
+
+	// BudgetOnlyThinking selects gateways that accept thinkingBudget for every
+	// routed model, including non-Gemini models behind the Gemini wire format.
+	BudgetOnlyThinking bool
+
+	// CumulativeStreamText accepts gateways which repeat the accumulated text
+	// on each chunk. Native Gemini delta streams should leave this disabled.
+	CumulativeStreamText bool
+
 	// ThinkingAdapterEnabled is the host thinking-suffix adapter toggle. The
 	// host and gemini_chat request conversion pass it to
 	// reasoning.ParseGeminiModelSuffix, so -thinking, -nothinking,

@@ -1,6 +1,7 @@
 package oaichat
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -32,6 +33,7 @@ type chatToGeminiStreamToolIDKey struct {
 }
 
 type chatToGeminiStreamTool struct {
+	Signature json.RawMessage
 	ID        string
 	Name      string
 	Arguments strings.Builder
@@ -96,6 +98,9 @@ func ResponseOpenAI2Gemini(openAIResponse *dto.OpenAITextResponse, info convmeta
 			Parts: make([]dto.GeminiPart, 0),
 		}
 
+		if thought := geminiThinkingPart(choice.Message.GetReasoningContent(), choice.Message.ReasoningSignature); thought != nil {
+			content.Parts = append(content.Parts, *thought)
+		}
 		textContent := choice.Message.StringContent()
 		if textContent != "" {
 			part := dto.GeminiPart{
@@ -107,6 +112,7 @@ func ResponseOpenAI2Gemini(openAIResponse *dto.OpenAITextResponse, info convmeta
 		toolCalls := choice.Message.ParseToolCalls()
 		for _, toolCall := range toolCalls {
 			part := dto.GeminiPart{
+				ThoughtSignature: toolCall.ExtraContent.ThoughtSignature(),
 				FunctionCall: &dto.FunctionCall{
 					ID:           toolCall.ID,
 					FunctionName: toolCall.Function.Name,
@@ -129,7 +135,7 @@ func StreamResponseOpenAI2Gemini(openAIResponse *dto.ChatCompletionsStreamRespon
 	hasContent := false
 	hasFinishReason := false
 	for _, choice := range openAIResponse.Choices {
-		if len(choice.Delta.GetContentString()) > 0 || (choice.Delta.ToolCalls != nil && len(choice.Delta.ToolCalls) > 0) {
+		if len(choice.Delta.GetContentString()) > 0 || choice.Delta.GetReasoningContent() != "" || choice.Delta.ReasoningSignature != "" || len(choice.Delta.ToolCalls) > 0 {
 			hasContent = true
 		}
 		if choice.FinishReason != nil {
@@ -196,10 +202,14 @@ func StreamResponseOpenAI2Gemini(openAIResponse *dto.ChatCompletionsStreamRespon
 			Parts: make([]dto.GeminiPart, 0),
 		}
 
+		if thought := geminiThinkingPart(choice.Delta.GetReasoningContent(), choice.Delta.ReasoningSignature); thought != nil {
+			content.Parts = append(content.Parts, *thought)
+		}
 		// 处理工具调用
 		if choice.Delta.ToolCalls != nil {
 			for _, toolCall := range choice.Delta.ToolCalls {
 				part := dto.GeminiPart{
+					ThoughtSignature: toolCall.ExtraContent.ThoughtSignature(),
 					FunctionCall: &dto.FunctionCall{
 						ID:           toolCall.ID,
 						FunctionName: toolCall.Function.Name,
@@ -208,7 +218,8 @@ func StreamResponseOpenAI2Gemini(openAIResponse *dto.ChatCompletionsStreamRespon
 				}
 				content.Parts = append(content.Parts, part)
 			}
-		} else {
+		}
+		{
 			// 处理文本内容
 			textContent := choice.Delta.GetContentString()
 			if textContent != "" {
@@ -262,10 +273,11 @@ func (s *ChatToGeminiStreamState) ConvertChunk(openAIResponse *dto.ChatCompletio
 	for _, choice := range openAIResponse.Choices {
 		s.seenChoices[choice.Index] = true
 		hasText := choice.Delta.GetContentString() != ""
+		hasThought := choice.Delta.GetReasoningContent() != "" || choice.Delta.ReasoningSignature != ""
 		hasToolDelta := len(choice.Delta.ToolCalls) > 0
 		hasFinish := choice.FinishReason != nil && strings.TrimSpace(*choice.FinishReason) != ""
 		if s.finishedChoices[choice.Index] {
-			if hasText || hasToolDelta {
+			if hasText || hasThought || hasToolDelta {
 				return nil, fmt.Errorf("OpenAI chat choice %d received data after completion", choice.Index)
 			}
 			continue
@@ -287,6 +299,9 @@ func (s *ChatToGeminiStreamState) ConvertChunk(openAIResponse *dto.ChatCompletio
 				Role:  "model",
 				Parts: make([]dto.GeminiPart, 0),
 			},
+		}
+		if thought := geminiThinkingPart(choice.Delta.GetReasoningContent(), choice.Delta.ReasoningSignature); thought != nil {
+			candidate.Content.Parts = append(candidate.Content.Parts, *thought)
 		}
 		if hasText {
 			candidate.Content.Parts = append(candidate.Content.Parts, dto.GeminiPart{Text: choice.Delta.GetContentString()})
@@ -443,6 +458,9 @@ func (s *ChatToGeminiStreamState) appendToolCallDelta(choiceIndex int, toolCall 
 		}
 		tool.Name = incomingName
 	}
+	if signature := toolCall.ExtraContent.ThoughtSignature(); len(signature) > 0 {
+		tool.Signature = signature
+	}
 	tool.Arguments.WriteString(toolCall.Function.Arguments)
 	return nil
 }
@@ -461,7 +479,7 @@ func (s *ChatToGeminiStreamState) finishChoice(choiceIndex int) ([]dto.GeminiPar
 		if tool.Name == "" {
 			return nil, fmt.Errorf("OpenAI chat choice %d has a tool call without a function name", choiceIndex)
 		}
-		parts = append(parts, dto.GeminiPart{FunctionCall: &dto.FunctionCall{
+		parts = append(parts, dto.GeminiPart{ThoughtSignature: tool.Signature, FunctionCall: &dto.FunctionCall{
 			ID:           tool.ID,
 			FunctionName: tool.Name,
 			Arguments:    geminiFunctionArguments(tool.Arguments.String()),
@@ -555,4 +573,15 @@ func openAIBillingUsageFromUsage(usage *dto.Usage) *dto.BillingUsage {
 		return existingBillingUsage
 	}
 	return dto.NewOpenAIChatBillingUsage(usage)
+}
+
+func geminiThinkingPart(text, signature string) *dto.GeminiPart {
+	if text == "" && signature == "" {
+		return nil
+	}
+	part := &dto.GeminiPart{Text: text, Thought: true}
+	if signature != "" {
+		part.ThoughtSignature, _ = kitutil.Marshal(signature)
+	}
+	return part
 }

@@ -4,8 +4,9 @@
   "role": "assistant",
   "content": [
     {
-      "type": "thinking",
-      "thinking": "Deep thought."
+      "signature": "",
+      "thinking": "Deep thought.",
+      "type": "thinking"
     },
     {
       "type": "text",

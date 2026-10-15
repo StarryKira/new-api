@@ -17,9 +17,8 @@
         {
           "type": "image",
           "source": {
-            "type": "base64",
-            "media_type": "image/png",
-            "data": "aGVsbG8="
+            "type": "url",
+            "url": "https://example.com/cat.png"
           }
         }
       ]

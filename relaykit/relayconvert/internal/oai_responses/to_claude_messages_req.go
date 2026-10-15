@@ -95,6 +95,17 @@ func OpenAIResponsesRequestToClaudeMessages(c context.Context, info convmeta.Met
 	for _, item := range inputItems {
 		itemType := strings.TrimSpace(kitutil.Interface2String(item["type"]))
 		switch itemType {
+		case "reasoning":
+			encoded := kitutil.Interface2String(item["encrypted_content"])
+			if block, ok := sharedclaude.DecodeThinkingBlock(encoded); ok {
+				claudeRequest.Messages = appendClaudeAssistantBlock(claudeRequest.Messages, block)
+			} else if strings.HasPrefix(encoded, sharedclaude.ThinkingEnvelopePrefix) {
+				return nil, fmt.Errorf("invalid Claude thinking envelope")
+			}
+		case "agent_message":
+			if text := responsesAgentMessageText(item["content"]); text != "" {
+				claudeRequest.Messages = append(claudeRequest.Messages, dto.ClaudeMessage{Role: "user", Content: text})
+			}
 		case ResponsesInputTypeFunctionCall:
 			claudeRequest.Messages = appendClaudeToolUse(claudeRequest.Messages, responsesFunctionCallItemToClaudeToolUse(item))
 		case ResponsesInputTypeCustomToolCall:
@@ -147,6 +158,9 @@ func OpenAIResponsesRequestToClaudeMessages(c context.Context, info convmeta.Met
 				Content: parts,
 			})
 		}
+	}
+	if convmeta.OptionsOf(info).RepairToolHistory {
+		claudeRequest.Messages = repairClaudeToolHistory(claudeRequest.Messages)
 	}
 	claudeRequest.Messages = omitTrailingAssistantText(c, claudeRequest.Messages,
 		func(message dto.ClaudeMessage) bool { return message.Role == "user" },
@@ -201,6 +215,10 @@ func responsesInputContentToClaudeMediaMessages(c context.Context, content any) 
 		case "input_image", "input_file", "input_audio", "input_video":
 			source := ContentPartToFileSource(contentPart)
 			if source == nil {
+				continue
+			}
+			if partType == "input_image" && source.IsURL() {
+				parts = append(parts, dto.ClaudeMediaMessage{Type: "image", Source: &dto.ClaudeMessageSource{Type: "url", Url: source.GetRawData()}})
 				continue
 			}
 			// Claude content blocks carry images, PDF documents, and text
@@ -356,4 +374,15 @@ func ensureClaudeMessagesStartWithUser(messages []dto.ClaudeMessage) []dto.Claud
 			},
 		},
 	}, messages...)
+}
+
+// Signed reasoning and the following tool calls belong to one assistant turn.
+func appendClaudeAssistantBlock(messages []dto.ClaudeMessage, block dto.ClaudeMediaMessage) []dto.ClaudeMessage {
+	if len(messages) == 0 || messages[len(messages)-1].Role != "assistant" {
+		return append(messages, dto.ClaudeMessage{Role: "assistant", Content: []dto.ClaudeMediaMessage{block}})
+	}
+	i := len(messages) - 1
+	parts := claudeMessageContentParts(messages[i].Content)
+	messages[i].Content = append(parts, block)
+	return messages
 }

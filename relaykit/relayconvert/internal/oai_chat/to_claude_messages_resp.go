@@ -36,6 +36,11 @@ func stopOpenBlocks(state *convmeta.ClaudeConvertInfo) []*dto.ClaudeResponse {
 		responses := make([]*dto.ClaudeResponse, 0, len(state.ToolCalls))
 		for _, tool := range state.ToolCalls {
 			if tool != nil && tool.Started {
+				if !tool.HasArguments {
+					arguments := "{}"
+					responses = append(responses, &dto.ClaudeResponse{Type: "content_block_delta", Index: kitutil.GetPointer(tool.BlockIndex), Delta: &dto.ClaudeMediaMessage{Type: "input_json_delta", PartialJson: &arguments}})
+					tool.HasArguments = true
+				}
 				responses = append(responses, generateStopBlock(tool.BlockIndex))
 			}
 		}
@@ -70,6 +75,7 @@ func startPendingToolBlocks(state *convmeta.ClaudeConvertInfo) []*dto.ClaudeResp
 		})
 		tool.Started = true
 		if tool.PendingArguments != "" {
+			tool.HasArguments = true
 			arguments := tool.PendingArguments
 			responses = append(responses, &dto.ClaudeResponse{
 				Index: &idx,
@@ -215,7 +221,8 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 	if len(openAIResponse.Choices) == 0 {
 		// Some OpenAI-compatible upstreams end with a usage-only SSE chunk.
 		oaiUsage := clientVisibleClaudeStreamUsage(state, openAIResponse.Usage)
-		if oaiUsage != nil {
+		if oaiUsage != nil && (!state.RequireTerminalEvent || state.FinishReason != "") {
+			claudeResponses = append(claudeResponses, claudeReasoningFallback(state, convmeta.OptionsOf(info).ReasoningOnlyAsText)...)
 			appendStopOpenBlocks()
 			stopReason := stopReasonOpenAI2Claude(state.FinishReason)
 			if stopReason == "" {
@@ -236,6 +243,11 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 		return claudeResponses
 	} else {
 		chosenChoice := openAIResponse.Choices[0]
+		if convmeta.OptionsOf(info).ReasoningOnlyAsText {
+			state.ReasoningText.WriteString(chosenChoice.Delta.GetReasoningContent())
+		}
+		state.SawText = state.SawText || chosenChoice.Delta.GetContentString() != ""
+		state.SawToolCall = state.SawToolCall || len(chosenChoice.Delta.ToolCalls) > 0
 		doneChunk := chosenChoice.FinishReason != nil && *chosenChoice.FinishReason != ""
 		if doneChunk {
 			state.FinishReason = *chosenChoice.FinishReason
@@ -306,6 +318,7 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 					})
 					tool.Started = true
 					if tool.PendingArguments != "" {
+						tool.HasArguments = true
 						arguments := tool.PendingArguments
 						claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
 							Index: &idx,
@@ -321,6 +334,7 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 				}
 
 				if tool.Started && toolCall.Function.Arguments != "" {
+					tool.HasArguments = true
 					claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
 						Index: &idx,
 						Type:  "content_block_delta",
@@ -340,7 +354,7 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 			// text in one chunk: the thinking block closes before the text block opens.
 			reasoning := chosenChoice.Delta.GetReasoningContent()
 			textContent := chosenChoice.Delta.GetContentString()
-			if reasoning != "" {
+			if reasoning != "" || chosenChoice.Delta.ReasoningSignature != "" {
 				if state.LastMessagesType != convmeta.LastMessageTypeThinking {
 					stopOpenBlocksAndAdvance()
 					idx := state.Index
@@ -362,6 +376,9 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 						Thinking: &reasoning,
 					},
 				})
+			}
+			if signature := chosenChoice.Delta.ReasoningSignature; signature != "" {
+				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{Type: "content_block_delta", Index: kitutil.GetPointer(state.Index), Delta: &dto.ClaudeMediaMessage{Type: "signature_delta", Signature: signature}})
 			}
 			if textContent != "" {
 				if state.LastMessagesType != convmeta.LastMessageTypeText {
@@ -398,6 +415,7 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 				// can carry both usage and the final stop reason.
 				return claudeResponses
 			}
+			claudeResponses = append(claudeResponses, claudeReasoningFallback(state, convmeta.OptionsOf(info).ReasoningOnlyAsText)...)
 			appendStopOpenBlocks()
 			claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
 				Type:  "message_delta",
@@ -430,7 +448,14 @@ func FinalizeStreamResponseOpenAI2Claude(info convmeta.Meta) []*dto.ClaudeRespon
 	if stopReason == "" {
 		stopReason = "end_turn"
 	}
-	responses := startPendingToolBlocks(state)
+	var responses []*dto.ClaudeResponse
+	if info.GetSendResponseCount() == 0 {
+		msg := &dto.ClaudeMediaMessage{Id: "msg_" + kitutil.GetUUID(), Type: "message", Role: "assistant", Model: info.GetOriginModelName(), Usage: &dto.ClaudeUsage{}}
+		msg.SetContent([]any{})
+		responses = append(responses, &dto.ClaudeResponse{Type: "message_start", Message: msg})
+	}
+	responses = append(responses, claudeReasoningFallback(state, convmeta.OptionsOf(info).ReasoningOnlyAsText)...)
+	responses = append(responses, startPendingToolBlocks(state)...)
 	responses = append(responses, stopOpenBlocks(state)...)
 	responses = append(responses,
 		&dto.ClaudeResponse{
@@ -447,7 +472,7 @@ func FinalizeStreamResponseOpenAI2Claude(info convmeta.Meta) []*dto.ClaudeRespon
 }
 
 func ResponseOpenAI2Claude(openAIResponse *dto.OpenAITextResponse, info convmeta.Meta) *dto.ClaudeResponse {
-	var stopReason string
+	stopReason := "end_turn"
 	contents := make([]dto.ClaudeMediaMessage, 0)
 	claudeResponse := &dto.ClaudeResponse{
 		Id:    openAIResponse.Id,
@@ -455,13 +480,19 @@ func ResponseOpenAI2Claude(openAIResponse *dto.OpenAITextResponse, info convmeta
 		Role:  "assistant",
 		Model: openAIResponse.Model,
 	}
+	if claudeResponse.Id == "" {
+		claudeResponse.Id = "msg_" + kitutil.GetUUID()
+	}
 	for _, choice := range openAIResponse.Choices {
 		stopReason = stopReasonOpenAI2Claude(choice.FinishReason)
 		reasoningContent := choice.Message.GetReasoningContent()
 		textContent := choice.Message.StringContent()
 		toolCalls := choice.Message.ParseToolCalls()
-		if reasoningContent != "" {
-			claudeContent := dto.ClaudeMediaMessage{Type: "thinking"}
+		if convmeta.OptionsOf(info).ReasoningOnlyAsText && textContent == "" && len(toolCalls) == 0 && strings.TrimSpace(reasoningContent) != "" {
+			textContent = reasoningContent
+		}
+		if reasoningContent != "" || choice.Message.ReasoningSignature != "" {
+			claudeContent := dto.ClaudeMediaMessage{Type: "thinking", Signature: choice.Message.ReasoningSignature}
 			claudeContent.Thinking = kitutil.GetPointer(reasoningContent)
 			contents = append(contents, claudeContent)
 		}
@@ -480,6 +511,7 @@ func ResponseOpenAI2Claude(openAIResponse *dto.OpenAITextResponse, info convmeta
 			claudeContent.Type = "tool_use"
 			claudeContent.Id = toolUse.ID
 			claudeContent.Name = toolUse.Function.Name
+			_ = kitutil.Unmarshal(toolUse.ExtraContent.ThoughtSignature(), &claudeContent.Signature)
 			mapParams := map[string]any{}
 			if strings.TrimSpace(toolUse.Function.Arguments) != "" {
 				var parsed map[string]any
@@ -491,6 +523,9 @@ func ResponseOpenAI2Claude(openAIResponse *dto.OpenAITextResponse, info convmeta
 			contents = append(contents, claudeContent)
 		}
 	}
+	if len(contents) == 0 {
+		contents = []dto.ClaudeMediaMessage{{Type: "text", Text: kitutil.GetPointer("")}}
+	}
 	claudeResponse.Content = contents
 	claudeResponse.StopReason = stopReason
 	claudeResponse.Usage = buildClaudeUsageFromOpenAIUsage(&openAIResponse.Usage)
@@ -500,4 +535,21 @@ func ResponseOpenAI2Claude(openAIResponse *dto.OpenAITextResponse, info convmeta
 
 func stopReasonOpenAI2Claude(reason string) string {
 	return reasonmap.OpenAIFinishReasonToClaudeStopReason(reason)
+}
+
+func claudeReasoningFallback(state *convmeta.ClaudeConvertInfo, enabled bool) []*dto.ClaudeResponse {
+	if !enabled || state.SawText || state.SawToolCall || strings.TrimSpace(state.ReasoningText.String()) == "" {
+		return nil
+	}
+	events := stopOpenBlocks(state)
+	if state.LastMessagesType != convmeta.LastMessageTypeNone {
+		state.Index++
+	}
+	state.LastMessagesType = convmeta.LastMessageTypeText
+	state.SawText = true
+	index := state.Index
+	return append(events,
+		&dto.ClaudeResponse{Type: "content_block_start", Index: &index, ContentBlock: &dto.ClaudeMediaMessage{Type: "text", Text: kitutil.GetPointer("")}},
+		&dto.ClaudeResponse{Type: "content_block_delta", Index: &index, Delta: &dto.ClaudeMediaMessage{Type: "text_delta", Text: kitutil.GetPointer(state.ReasoningText.String())}},
+	)
 }

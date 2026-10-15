@@ -43,10 +43,6 @@ func TestLookupBuiltinResponseConverters(t *testing.T) {
 			from:     types.RelayFormatClaude,
 			to:       types.RelayFormatOpenAIResponses,
 			quality:  ResponseConverterQualityFair,
-			stepConverters: []string{
-				ConverterClaudeMessagesToOpenAIChat,
-				ConverterOpenAIChatToOpenAIResponses,
-			},
 		},
 		{
 			lookupID: responseConverterGeminiToClaude,
@@ -54,10 +50,6 @@ func TestLookupBuiltinResponseConverters(t *testing.T) {
 			from:     types.RelayFormatGemini,
 			to:       types.RelayFormatClaude,
 			quality:  ResponseConverterQualityDiscouraged,
-			stepConverters: []string{
-				ConverterGeminiContentToOpenAIChat,
-				ConverterOpenAIChatToClaudeMessages,
-			},
 		},
 		{
 			lookupID: responseConverterGeminiToResponses,

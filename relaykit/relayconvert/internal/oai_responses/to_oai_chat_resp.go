@@ -63,6 +63,14 @@ func ResponsesResponseToChatCompletionsResponse(resp *dto.OpenAIResponsesRespons
 
 	text := ExtractOutputTextFromResponses(resp)
 	reasoning := ExtractReasoningTextFromResponses(resp)
+	var refusal strings.Builder
+	for _, item := range resp.Output {
+		for _, part := range item.Content {
+			if part.Type == "refusal" {
+				refusal.WriteString(part.Refusal)
+			}
+		}
+	}
 
 	usage := UsageFromResponsesUsage(resp.Usage)
 
@@ -109,6 +117,12 @@ func ResponsesResponseToChatCompletionsResponse(resp *dto.OpenAIResponsesRespons
 	} else if len(annotations) > 0 {
 		msg.Annotations = annotations
 	}
+	if refusal.Len() > 0 {
+		msg.Refusal = kitutil.GetPointer(refusal.String())
+		if text == "" {
+			msg.Content = nil
+		}
+	}
 	if reasoning != "" {
 		msg.ReasoningContent = &reasoning
 	}
@@ -117,10 +131,11 @@ func ResponsesResponseToChatCompletionsResponse(resp *dto.OpenAIResponsesRespons
 	}
 
 	out := &dto.OpenAITextResponse{
-		Id:      id,
-		Object:  "chat.completion",
-		Created: created,
-		Model:   resp.Model,
+		ServiceTier: resp.ServiceTier,
+		Id:          id,
+		Object:      "chat.completion",
+		Created:     created,
+		Model:       resp.Model,
 		Choices: []dto.OpenAITextResponseChoice{
 			{
 				Index:        0,
@@ -220,15 +235,14 @@ func usageFromResponsesUsage(src *dto.Usage, createBillingSnapshot bool) *dto.Us
 	if src.InputTokensDetails != nil {
 		usage.PromptTokensDetails = src.InputTokensDetails.Clone()
 	}
-	if src.CompletionTokenDetails.ReasoningTokens != 0 ||
-		src.CompletionTokenDetails.TextTokens != 0 ||
-		src.CompletionTokenDetails.AudioTokens != 0 ||
-		src.CompletionTokenDetails.ImageTokens != 0 {
-		usage.CompletionTokenDetails.ReasoningTokens = src.CompletionTokenDetails.ReasoningTokens
-		usage.CompletionTokenDetails.TextTokens = src.CompletionTokenDetails.TextTokens
-		usage.CompletionTokenDetails.AudioTokens = src.CompletionTokenDetails.AudioTokens
-		usage.CompletionTokenDetails.ImageTokens = src.CompletionTokenDetails.ImageTokens
+	usage.CompletionTokenDetails = src.CompletionTokenDetails
+	if src.OutputTokensDetails != nil {
+		usage.CompletionTokenDetails = *src.OutputTokensDetails
 	}
+	if usage.PromptTokensDetails.CacheCreationTokensTotal() == 0 {
+		usage.PromptTokensDetails.CachedCreationTokens = src.LegacyCacheCreationInputTokens
+	}
+
 	usage.ClaudeCacheCreation5mTokens = src.ClaudeCacheCreation5mTokens
 	usage.ClaudeCacheCreation1hTokens = src.ClaudeCacheCreation1hTokens
 	return usage

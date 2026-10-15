@@ -181,6 +181,15 @@ func ClaudeMessagesRequestToOpenAIChat(ctx context.Context, claudeRequest dto.Cl
 					toolNames[mediaMsg.Id] = mediaMsg.Name
 				}
 				switch mediaMsg.Type {
+				case "thinking":
+					text := openAIMessage.GetReasoningContent()
+					if mediaMsg.Thinking != nil {
+						text += *mediaMsg.Thinking
+					}
+					openAIMessage.ReasoningContent = &text
+					if mediaMsg.Signature != "" {
+						openAIMessage.ReasoningSignature = mediaMsg.Signature
+					}
 				case "text", "input_text":
 					message := dto.MediaContent{
 						Type:         "text",
@@ -242,6 +251,10 @@ func ClaudeMessagesRequestToOpenAIChat(ctx context.Context, claudeRequest dto.Cl
 							Arguments: requestToJSONString(mediaMsg.Input),
 						},
 					}
+					if mediaMsg.Signature != "" {
+						signature, _ := kitutil.Marshal(mediaMsg.Signature)
+						toolCall.ExtraContent = dto.GoogleThoughtSignature(signature)
+					}
 					toolCalls = append(toolCalls, toolCall)
 				case "tool_result":
 					toolName := mediaMsg.Name
@@ -274,7 +287,7 @@ func ClaudeMessagesRequestToOpenAIChat(ctx context.Context, claudeRequest dto.Cl
 				openAIMessage.SetMediaContent(mediaMessages)
 			}
 		}
-		if len(openAIMessage.ParseContent()) > 0 || len(openAIMessage.ToolCalls) > 0 {
+		if len(openAIMessage.ParseContent()) > 0 || len(openAIMessage.ToolCalls) > 0 || openAIMessage.GetReasoningContent() != "" {
 			openAIMessages = append(openAIMessages, openAIMessage)
 		}
 	}
@@ -300,6 +313,8 @@ func claudeToolResultToChat(blocks []dto.ClaudeMediaMessage) (string, []dto.Medi
 			if text := block.GetText(); text != "" {
 				texts = append(texts, text)
 			}
+		case block.Type == "document" && block.Source != nil && block.Source.Type == "base64" && block.Source.MediaType == "application/pdf":
+			media = append(media, dto.MediaContent{Type: dto.ContentTypeFile, File: &dto.MessageFile{FileName: "document.pdf", FileData: "data:application/pdf;base64," + kitutil.Interface2String(block.Source.Data)}})
 		case block.Type == "image":
 			url := claudeImageSourceURL(block.Source)
 			if url == "" {

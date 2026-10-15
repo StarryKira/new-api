@@ -83,11 +83,20 @@ func GeminiGenerateContentRequestToOpenAIChat(ctx context.Context, geminiRequest
 		var toolCalls []dto.ToolCallRequest
 		var reasoningTexts []string
 		for partIndex, part := range content.Parts {
-			if part.Text != "" {
-				if part.Thought {
-					reasoningTexts = append(reasoningTexts, part.Text)
-					continue
+			if part.FunctionCall == nil {
+				if signature := geminiThoughtSignature(part.ThoughtSignature); signature != "" {
+					message.ReasoningSignature = signature
 				}
+			}
+			if part.Thought || (len(part.ThoughtSignature) > 0 && part.FunctionCall == nil && part.Text == "") {
+				reasoningTexts = append(reasoningTexts, part.Text)
+				var signature string
+				if kitutil.Unmarshal(part.ThoughtSignature, &signature) == nil && signature != "" {
+					message.ReasoningSignature = signature
+				}
+				continue
+			}
+			if part.Text != "" {
 				mediaContent := dto.MediaContent{
 					Type: "text",
 					Text: part.Text,
@@ -111,8 +120,9 @@ func GeminiGenerateContentRequestToOpenAIChat(ctx context.Context, geminiRequest
 				mediaContents = append(mediaContents, mediaContent)
 			} else if part.FunctionCall != nil {
 				toolCall := dto.ToolCallRequest{
-					ID:   callHistory.add(part.FunctionCall),
-					Type: "function",
+					ExtraContent: dto.GoogleThoughtSignature(part.ThoughtSignature),
+					ID:           callHistory.add(part.FunctionCall),
+					Type:         "function",
 					Function: dto.FunctionRequest{
 						Name:      part.FunctionCall.FunctionName,
 						Arguments: jsonutil.ToJSONString(part.FunctionCall.Arguments),
@@ -131,7 +141,8 @@ func GeminiGenerateContentRequestToOpenAIChat(ctx context.Context, geminiRequest
 
 		if len(toolCalls) > 0 {
 			message.SetToolCalls(toolCalls)
-		} else if len(mediaContents) == 1 && mediaContents[0].Type == "text" {
+		}
+		if len(mediaContents) == 1 && mediaContents[0].Type == "text" {
 			message.Content = mediaContents[0].Text
 		} else if len(mediaContents) > 0 {
 			message.SetMediaContent(mediaContents)
